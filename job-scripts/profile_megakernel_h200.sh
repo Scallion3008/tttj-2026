@@ -23,7 +23,18 @@ hostname
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 "${NCU}" --version | tail -1
 
-for batch_size in 128 10000; do
+if [[ "${PROFILE_LAUNCH_ONLY:-0}" == "1" ]]; then
+    profile_sections=(--section LaunchStats)
+else
+    profile_sections=(
+        --set detailed
+        --section InstructionStats
+        --section SchedulerStats
+        --section WarpStateStats
+    )
+fi
+
+for batch_size in ${PROFILE_BATCHES:-128 10000}; do
     report="job-scripts/ncu_megakernel_b${batch_size}_${SLURM_JOB_ID}"
     "${NCU}" \
         --force-overwrite \
@@ -31,10 +42,7 @@ for batch_size in 128 10000; do
         --kernel-name-base function \
         --kernel-name regex:_transformer_megakernel \
         --launch-count 1 \
-        --set detailed \
-        --section InstructionStats \
-        --section SchedulerStats \
-        --section WarpStateStats \
+        "${profile_sections[@]}" \
         --export "${report}" \
         uv run --frozen python profile_megakernel.py --batch-size "${batch_size}"
     "${NCU}" --import "${report}.ncu-rep" --page details > "${report}.txt"

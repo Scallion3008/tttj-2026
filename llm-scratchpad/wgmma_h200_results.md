@@ -125,5 +125,7 @@ from 32.3355 to 12.2233 ms for case 6 (2.65x faster kernel).
   1.1415/87.0174 ms and failed the gate; it was removed.
 - A layerwise Torch SDPA comparison measured 0.7552/40.8155 ms and failed the
   gate. It was slower than the fused path and was removed.
-- Triton `num_ctas=2` and `num_ctas=4` cluster attempts failed compiler
-  lowering for this megakernel and are not part of the production launch.
+- Initial Triton `num_ctas=2` and `num_ctas=4` attempts failed compiler
+  lowering. A later exact two-CTA experimental path is documented in
+  [cluster_h200_results.md](cluster_h200_results.md); it remains slower than
+  the one-CTA production launch.

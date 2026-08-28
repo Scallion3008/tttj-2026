@@ -22,4 +22,8 @@ hostname
 nvcc --version
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 
-uv run --frozen python benchmark_steps_1_2.py --mode benchmarks --quick "$@"
+benchmark_args=(--mode benchmarks)
+if [[ "${BENCH_QUICK:-1}" == "1" ]]; then
+    benchmark_args+=(--quick)
+fi
+uv run --frozen python benchmark_steps_1_2.py "${benchmark_args[@]}" "$@"
