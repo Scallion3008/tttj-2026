@@ -1,0 +1,22 @@
+[project]
+name = "tttj-2026"
+version = "0.1.0"
+requires-python = ">=3.12.0"
+dependencies = [
+  "ninja>=1.13.0",
+  "torch>=2.8.0",
+  "torchvision>=0.23.0",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
