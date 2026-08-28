@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -14,7 +16,7 @@ HEADS = 4
 HEAD_DIM = 32
 LAYERS = 4
 ELEMENTS = SEQUENCE * MODEL
-WORKSPACE_SLOTS = 6
+WORKSPACE_SLOTS = 3
 TRACE_STAGES_PER_LAYER = 9
 TRACE_SLOTS = (
     LAYERS * TRACE_STAGES_PER_LAYER
@@ -58,6 +60,30 @@ JIT_FFN_IN_WEIGHT = tl.constexpr(FFN_IN_WEIGHT)
 JIT_FFN_IN_BIAS = tl.constexpr(FFN_IN_BIAS)
 JIT_FFN_OUT_WEIGHT = tl.constexpr(FFN_OUT_WEIGHT)
 JIT_FFN_OUT_BIAS = tl.constexpr(FFN_OUT_BIAS)
+
+
+def _environment_integer(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
+
+
+# Internal tuning switches make it possible to compare numerical/performance
+# trade-offs in isolated Slurm processes without maintaining source variants.
+NORM_MODE = _environment_integer("TTTJ_NORM_MODE", 0)
+SOFTMAX_MODE = _environment_integer("TTTJ_SOFTMAX_MODE", 0)
+DIVISION_MODE = _environment_integer("TTTJ_DIVISION_MODE", 4)
+EXP_MODE = _environment_integer("TTTJ_EXP_MODE", 0)
+GELU_MODE = _environment_integer("TTTJ_GELU_MODE", 0)
+CAUSAL_SKIP = bool(_environment_integer("TTTJ_CAUSAL_SKIP", 0))
+NUM_WARPS = _environment_integer("TTTJ_NUM_WARPS", 4)
+NUM_STAGES = _environment_integer("TTTJ_NUM_STAGES", 3)
+LINEAR_REDUCTION_TILE = _environment_integer("TTTJ_LINEAR_K", 64)
+ATTENTION_REDUCTION_TILE = _environment_integer("TTTJ_ATTENTION_K", 32)
+LINEAR_ROW_TILE = _environment_integer("TTTJ_LINEAR_M", 64)
+# Q overwrites its normalized input after K/V are produced, so the linear
+# output must cover the full row in one tile before that alias is safe.
+LINEAR_OUTPUT_TILE = 128
+ALL_VALID_TOKENS = bool(_environment_integer("TTTJ_ALL_VALID", 0))
+EXPLICIT_BARRIERS = bool(_environment_integer("TTTJ_BARRIERS", 0))
 
 
 @triton.jit
@@ -142,43 +168,53 @@ def _layer_norm_half(
     row_start,
     D: tl.constexpr,
     ROWS: tl.constexpr,
+    NORM_ALGORITHM: tl.constexpr,
 ):
     rows = row_start + tl.arange(0, ROWS)
     columns = tl.arange(0, D)
     offsets = rows[:, None] * D + columns[None, :]
     values = tl.load(input_ptr + offsets).to(tl.float32)
 
-    # PyTorch's aligned FP16 LayerNorm assigns one half4 to each lane and
-    # reduces the 32 per-lane Welford accumulators with shfl_down.
-    lane_values = tl.reshape(values, (ROWS, 32, 4))
-    lane_pairs = tl.reshape(lane_values, (ROWS, 32, 2, 2))
-    even, odd = tl.split(lane_pairs)
-    item0, item2 = tl.split(even)
-    item1, item3 = tl.split(odd)
-    mean = tl.zeros_like(item0)
-    sigma2 = tl.zeros_like(item0)
-    count = tl.zeros_like(item0)
-    mean, sigma2, count = _welford_online(item0, mean, sigma2, count)
-    mean, sigma2, count = _welford_online(item1, mean, sigma2, count)
-    mean, sigma2, count = _welford_online(item2, mean, sigma2, count)
-    mean, sigma2, count = _welford_online(item3, mean, sigma2, count)
-    mean, sigma2, count = _welford_combine_halves(
-        mean, sigma2, count, ROWS, 32
-    )
-    mean, sigma2, count = _welford_combine_halves(
-        mean, sigma2, count, ROWS, 16
-    )
-    mean, sigma2, count = _welford_combine_halves(
-        mean, sigma2, count, ROWS, 8
-    )
-    mean, sigma2, count = _welford_combine_halves(
-        mean, sigma2, count, ROWS, 4
-    )
-    mean, sigma2, count = _welford_combine_halves(
-        mean, sigma2, count, ROWS, 2
-    )
-    mean = tl.reshape(mean, (ROWS,))
-    variance = tl.reshape(sigma2, (ROWS,)) / D
+    if NORM_ALGORITHM == 0:
+        # PyTorch's aligned FP16 LayerNorm assigns one half4 to each lane and
+        # reduces the 32 per-lane Welford accumulators with shfl_down.
+        lane_values = tl.reshape(values, (ROWS, 32, 4))
+        lane_pairs = tl.reshape(lane_values, (ROWS, 32, 2, 2))
+        even, odd = tl.split(lane_pairs)
+        item0, item2 = tl.split(even)
+        item1, item3 = tl.split(odd)
+        mean = tl.zeros_like(item0)
+        sigma2 = tl.zeros_like(item0)
+        count = tl.zeros_like(item0)
+        mean, sigma2, count = _welford_online(item0, mean, sigma2, count)
+        mean, sigma2, count = _welford_online(item1, mean, sigma2, count)
+        mean, sigma2, count = _welford_online(item2, mean, sigma2, count)
+        mean, sigma2, count = _welford_online(item3, mean, sigma2, count)
+        mean, sigma2, count = _welford_combine_halves(
+            mean, sigma2, count, ROWS, 32
+        )
+        mean, sigma2, count = _welford_combine_halves(
+            mean, sigma2, count, ROWS, 16
+        )
+        mean, sigma2, count = _welford_combine_halves(
+            mean, sigma2, count, ROWS, 8
+        )
+        mean, sigma2, count = _welford_combine_halves(
+            mean, sigma2, count, ROWS, 4
+        )
+        mean, sigma2, count = _welford_combine_halves(
+            mean, sigma2, count, ROWS, 2
+        )
+        mean = tl.reshape(mean, (ROWS,))
+        variance = tl.reshape(sigma2, (ROWS,)) / D
+    elif NORM_ALGORITHM == 1:
+        mean = tl.sum(values, axis=1) / D
+        centered = values - mean[:, None]
+        variance = tl.sum(centered * centered, axis=1) / D
+    else:
+        mean = tl.sum(values, axis=1) / D
+        mean_square = tl.sum(values * values, axis=1) / D
+        variance = tl.maximum(mean_square - mean * mean, 0.0)
     inverse_std = libdevice.rsqrt(variance + 1.0e-5)
     weight = tl.load(weight_ptr + columns)[None, :].to(tl.float32)
     bias = tl.load(bias_ptr + columns)[None, :].to(tl.float32)
@@ -187,7 +223,7 @@ def _layer_norm_half(
 
 
 @triton.jit
-def _linear_64x64(
+def _linear_tile(
     input_ptr,
     output_ptr,
     weight_ptr,
@@ -198,12 +234,17 @@ def _linear_64x64(
     column_start,
     D: tl.constexpr,
     EPILOGUE: tl.constexpr,
+    GELU_ALGORITHM: tl.constexpr,
+    REDUCTION_TILE: tl.constexpr,
+    ROW_TILE: tl.constexpr,
+    OUTPUT_TILE: tl.constexpr,
+    ALL_VALID: tl.constexpr,
 ):
-    rows = row_start + tl.arange(0, 64)
-    columns = column_start + tl.arange(0, 64)
-    reductions = tl.arange(0, 32)
-    accumulator = tl.zeros((64, 64), dtype=tl.float32)
-    for reduction_start in range(0, D, 32):
+    rows = row_start + tl.arange(0, ROW_TILE)
+    columns = column_start + tl.arange(0, OUTPUT_TILE)
+    reductions = tl.arange(0, REDUCTION_TILE)
+    accumulator = tl.zeros((ROW_TILE, OUTPUT_TILE), dtype=tl.float32)
+    for reduction_start in range(0, D, REDUCTION_TILE):
         input_tile = tl.load(
             input_ptr
             + rows[:, None] * D
@@ -221,13 +262,40 @@ def _linear_64x64(
 
     if EPILOGUE == 1:
         rounded = accumulator.to(tl.float16).to(tl.float32)
-        output = 0.5 * rounded * (
-            1.0 + libdevice.erf(rounded * 0.7071067811865475)
-        )
+        if GELU_ALGORITHM == 0:
+            output = 0.5 * rounded * (
+                1.0 + libdevice.erf(rounded * 0.7071067811865475)
+            )
+        elif GELU_ALGORITHM < 3:
+            inner = 0.7978845608028654 * (
+                rounded + 0.044715 * rounded * rounded * rounded
+            )
+            if GELU_ALGORITHM == 1:
+                activation = libdevice.tanh(inner)
+            else:
+                activation = 2.0 * tl.sigmoid(2.0 * inner) - 1.0
+            output = 0.5 * rounded * (1.0 + activation)
+        else:
+            # Hastings' single-precision erf approximation is substantially
+            # cheaper than libdevice erf and is accurate to about 1.5e-7.
+            argument = tl.abs(rounded) * 0.7071067811865475
+            reciprocal = 1.0 / (1.0 + 0.3275911 * argument)
+            polynomial = 1.061405429 * reciprocal - 1.453152027
+            polynomial = polynomial * reciprocal + 1.421413741
+            polynomial = polynomial * reciprocal - 0.284496736
+            polynomial = polynomial * reciprocal + 0.254829592
+            erf_absolute = 1.0 - (
+                polynomial
+                * reciprocal
+                * tl.exp(-(argument * argument))
+            )
+            erf_value = tl.where(rounded >= 0.0, erf_absolute, -erf_absolute)
+            output = 0.5 * rounded * (1.0 + erf_value)
     elif EPILOGUE == 2:
         branch = accumulator.to(tl.float16)
-        valid = tl.load(valid_ptr + rows)[:, None]
-        branch = tl.where(valid, branch, 0.0)
+        if not ALL_VALID:
+            valid = tl.load(valid_ptr + rows)[:, None]
+            branch = tl.where(valid, branch, 0.0)
         residual = tl.load(
             residual_ptr + rows[:, None] * D + columns[None, :]
         )
@@ -237,8 +305,11 @@ def _linear_64x64(
         residual = tl.load(
             residual_ptr + rows[:, None] * D + columns[None, :]
         )
-        valid = tl.load(valid_ptr + rows)[:, None]
-        output = tl.where(valid, residual + branch, 0.0)
+        if ALL_VALID:
+            output = residual + branch
+        else:
+            valid = tl.load(valid_ptr + rows)[:, None]
+            output = tl.where(valid, residual + branch, 0.0)
     else:
         output = accumulator
 
@@ -264,14 +335,20 @@ def _attention_64x32(
     S: tl.constexpr,
     D: tl.constexpr,
     HD: tl.constexpr,
+    K: tl.constexpr,
     SCALE: tl.constexpr,
     CAPTURE: tl.constexpr,
+    SOFTMAX_ALGORITHM: tl.constexpr,
+    DIVISION_ALGORITHM: tl.constexpr,
+    EXP_ALGORITHM: tl.constexpr,
+    REDUCTION_TILE: tl.constexpr,
+    ALL_VALID: tl.constexpr,
 ):
     queries = row_start + tl.arange(0, 64)
-    keys = tl.arange(0, S)
-    reductions = tl.arange(0, 16)
-    scores = tl.zeros((64, S), dtype=tl.float32)
-    for reduction_start in range(0, HD, 16):
+    keys = tl.arange(0, K)
+    reductions = tl.arange(0, REDUCTION_TILE)
+    scores = tl.zeros((64, K), dtype=tl.float32)
+    for reduction_start in range(0, HD, REDUCTION_TILE):
         query_tile = tl.load(
             q_ptr
             + queries[:, None] * D
@@ -290,12 +367,17 @@ def _attention_64x32(
 
     # Preserve the reference's FP16 QK output boundary and FP32 scalar scale.
     scores = scores.to(tl.float16).to(tl.float32) * SCALE
-    valid_keys = tl.load(valid_ptr + keys)[None, :]
-    scores = tl.where(
-        (keys[None, :] <= queries[:, None]) & valid_keys,
-        scores,
-        -float("inf"),
-    )
+    if ALL_VALID:
+        scores = tl.where(
+            keys[None, :] <= queries[:, None], scores, -float("inf")
+        )
+    else:
+        valid_keys = tl.load(valid_ptr + keys)[None, :]
+        scores = tl.where(
+            (keys[None, :] <= queries[:, None]) & valid_keys,
+            scores,
+            -float("inf"),
+        )
     # PyTorch stores the scaled score tensor in FP16 before softmax.float().
     scores = scores.to(tl.float16).to(tl.float32)
     if CAPTURE:
@@ -307,7 +389,10 @@ def _attention_64x32(
             scores,
         )
     maximum = tl.max(scores, axis=1)
-    numerator = libdevice.exp(scores - maximum[:, None])
+    if EXP_ALGORITHM == 0:
+        numerator = libdevice.exp(scores - maximum[:, None])
+    else:
+        numerator = tl.exp(scores - maximum[:, None])
     if CAPTURE:
         tl.store(
             numerator_trace_ptr
@@ -316,30 +401,60 @@ def _attention_64x32(
             + keys[None, :],
             numerator,
         )
-    # PyTorch's S=128 softmax assigns four columns to each warp lane, sums
-    # those four sequentially, then performs a 32-lane warp reduction.
-    lane_groups = tl.reshape(numerator, (64, 4, 32))
-    lane_groups = tl.permute(lane_groups, (0, 2, 1))
-    lane_pairs = tl.reshape(lane_groups, (64, 32, 2, 2))
-    even, odd = tl.split(lane_pairs)
-    item0, item2 = tl.split(even)
-    item1, item3 = tl.split(odd)
-    lane_sum = item0 + item1
-    lane_sum += item2
-    lane_sum += item3
-    # PersistentSoftmax.cuh uses shuffle-xor at offsets 16, 8, 4, 2, 1.
-    # Retaining lane zero at each step produces the same FP32 expression tree.
-    denominator = _warp_add_halves(lane_sum, 64, 32)
-    denominator = _warp_add_halves(denominator, 64, 16)
-    denominator = _warp_add_halves(denominator, 64, 8)
-    denominator = _warp_add_halves(denominator, 64, 4)
-    denominator = _warp_add_halves(denominator, 64, 2)
-    denominator = tl.reshape(denominator, (64,))
+    if SOFTMAX_ALGORITHM == 0:
+        # PersistentSoftmax assigns K / 32 columns to each warp lane, then
+        # performs a shuffle-xor tree at offsets 16, 8, 4, 2, and 1.
+        if K == 128:
+            lane_groups = tl.reshape(numerator, (64, 4, 32))
+            lane_groups = tl.permute(lane_groups, (0, 2, 1))
+            lane_pairs = tl.reshape(lane_groups, (64, 32, 2, 2))
+            even, odd = tl.split(lane_pairs)
+            item0, item2 = tl.split(even)
+            item1, item3 = tl.split(odd)
+            lane_sum = item0 + item1
+            lane_sum += item2
+            lane_sum += item3
+        else:
+            lane_groups = tl.reshape(numerator, (64, 2, 32))
+            lane_groups = tl.permute(lane_groups, (0, 2, 1))
+            item0, item1 = tl.split(lane_groups)
+            lane_sum = item0 + item1
+        denominator = _warp_add_halves(lane_sum, 64, 32)
+        denominator = _warp_add_halves(denominator, 64, 16)
+        denominator = _warp_add_halves(denominator, 64, 8)
+        denominator = _warp_add_halves(denominator, 64, 4)
+        denominator = _warp_add_halves(denominator, 64, 2)
+        denominator = tl.reshape(denominator, (64,))
+    else:
+        denominator = tl.sum(numerator, axis=1)
     if CAPTURE:
         tl.store(denominator_trace_ptr + head * S + queries, denominator)
-    # NVCC emits IEEE round-to-nearest division for PersistentSoftmax.cuh;
-    # Triton's `/` selects its fast division path and can move FP16 rounding.
-    probabilities = tl.div_rn(numerator, denominator[:, None])
+    if DIVISION_ALGORITHM == 0:
+        # NVCC emits IEEE round-to-nearest division for PersistentSoftmax.cuh;
+        # applying it elementwise is expensive but bit-exact.
+        probabilities = tl.div_rn(numerator, denominator[:, None])
+    elif DIVISION_ALGORITHM == 1:
+        # One accurate reciprocal per row is much cheaper than K divisions.
+        inverse_denominator = tl.div_rn(1.0, denominator)
+        probabilities = numerator * inverse_denominator[:, None]
+    elif DIVISION_ALGORITHM == 2:
+        probabilities = numerator / denominator[:, None]
+    elif DIVISION_ALGORITHM == 3:
+        inverse_denominator = 1.0 / denominator
+        inverse_denominator *= 2.0 - denominator * inverse_denominator
+        probabilities = numerator * inverse_denominator[:, None]
+    else:
+        # Correct a reciprocal-multiply quotient with its fused residual. This
+        # approaches correctly rounded division while retaining one division
+        # per row instead of one per probability.
+        inverse_denominator = tl.div_rn(1.0, denominator)
+        probabilities = numerator * inverse_denominator[:, None]
+        remainder = libdevice.fma_rn(
+            -probabilities,
+            denominator[:, None],
+            numerator,
+        )
+        probabilities += remainder * inverse_denominator[:, None]
     probabilities = probabilities.to(tl.float16)
     if CAPTURE:
         tl.store(
@@ -384,139 +499,229 @@ def _transformer_megakernel(
     LAYER_WEIGHTS: tl.constexpr,
     SCALE: tl.constexpr,
     CAPTURE: tl.constexpr,
+    NORM_ALGORITHM: tl.constexpr,
+    SOFTMAX_ALGORITHM: tl.constexpr,
+    DIVISION_ALGORITHM: tl.constexpr,
+    EXP_ALGORITHM: tl.constexpr,
+    GELU_ALGORITHM: tl.constexpr,
+    SKIP_CAUSAL_TILES: tl.constexpr,
+    LINEAR_K: tl.constexpr,
+    ATTENTION_K: tl.constexpr,
+    LINEAR_M: tl.constexpr,
+    LINEAR_N: tl.constexpr,
+    ALL_VALID: tl.constexpr,
+    USE_BARRIERS: tl.constexpr,
 ):
     sequence = tl.program_id(0)
     input_base = input_ptr + sequence * E
     valid_base = valid_ptr + sequence * S
     workspace_base = workspace_ptr + sequence * JIT_WORKSPACE_SLOTS * E
-    x = workspace_base
-    norm = x + E
-    q = norm + E
-    k = q + E
+    x = output_ptr + sequence * E
+    norm = workspace_base
+    q = norm
+    k = norm + E
     v = k + E
-    scratch = v + E
-
-    offsets = tl.arange(0, 256)
-    for start in range(0, E, 256):
-        tl.store(x + start + offsets, tl.load(input_base + start + offsets))
-    tl.debug_barrier()
 
     for layer in range(NUM_LAYERS):
         weights = packed_ptr + layer * LAYER_WEIGHTS
+        residual = input_base if layer == 0 else x
         for row_start in range(0, S, 64):
             _layer_norm_half(
-                x,
+                residual,
                 norm,
                 weights + JIT_NORM1_WEIGHT,
                 weights + JIT_NORM1_BIAS,
                 row_start,
                 D,
                 64,
+                NORM_ALGORITHM,
             )
-        tl.debug_barrier()
+        if USE_BARRIERS:
+            tl.debug_barrier()
         _trace_tensor(norm, trace_ptr, layer * 9, E, CAPTURE)
 
-        for row_start in range(0, S, 64):
-            for column_start in range(0, D, 64):
-                _linear_64x64(
-                    norm,
-                    q,
-                    weights + JIT_Q_WEIGHT,
-                    weights + JIT_Q_BIAS,
-                    x,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    0,
-                )
-                _linear_64x64(
+        for row_start in range(0, S, LINEAR_M):
+            for column_start in range(0, D, LINEAR_N):
+                _linear_tile(
                     norm,
                     k,
                     weights + JIT_K_WEIGHT,
                     weights + JIT_K_BIAS,
-                    x,
+                    residual,
                     valid_base,
                     row_start,
                     column_start,
                     D,
                     0,
+                    GELU_ALGORITHM,
+                    LINEAR_K,
+                    LINEAR_M,
+                    LINEAR_N,
+                    ALL_VALID,
                 )
-                _linear_64x64(
+                _linear_tile(
                     norm,
                     v,
                     weights + JIT_V_WEIGHT,
                     weights + JIT_V_BIAS,
-                    x,
+                    residual,
                     valid_base,
                     row_start,
                     column_start,
                     D,
                     0,
+                    GELU_ALGORITHM,
+                    LINEAR_K,
+                    LINEAR_M,
+                    LINEAR_N,
+                    ALL_VALID,
                 )
-        tl.debug_barrier()
+                _linear_tile(
+                    norm,
+                    q,
+                    weights + JIT_Q_WEIGHT,
+                    weights + JIT_Q_BIAS,
+                    residual,
+                    valid_base,
+                    row_start,
+                    column_start,
+                    D,
+                    0,
+                    GELU_ALGORITHM,
+                    LINEAR_K,
+                    LINEAR_M,
+                    LINEAR_N,
+                    ALL_VALID,
+                )
+        if USE_BARRIERS:
+            tl.debug_barrier()
         _trace_tensor(q, trace_ptr, layer * 9 + 1, E, CAPTURE)
         _trace_tensor(k, trace_ptr, layer * 9 + 2, E, CAPTURE)
         _trace_tensor(v, trace_ptr, layer * 9 + 3, E, CAPTURE)
 
         for head in range(H):
-            for row_start in range(0, S, 64):
+            if SKIP_CAUSAL_TILES:
                 _attention_64x32(
                     q,
                     k,
                     v,
-                    scratch,
+                    norm,
                     valid_base,
                     trace_ptr + (37 + layer * 8) * E,
                     trace_ptr + (41 + layer * 8) * E,
                     trace_ptr + (69 + layer * 4) * E,
                     trace_ptr + (85 + layer) * E,
-                    row_start,
+                    0,
                     head,
                     S,
                     D,
                     HD,
+                    64,
                     SCALE,
                     CAPTURE,
+                    SOFTMAX_ALGORITHM,
+                    DIVISION_ALGORITHM,
+                    EXP_ALGORITHM,
+                    ATTENTION_K,
+                    ALL_VALID,
                 )
-        tl.debug_barrier()
-        _trace_tensor(scratch, trace_ptr, layer * 9 + 4, E, CAPTURE)
-
-        for row_start in range(0, S, 64):
-            for column_start in range(0, D, 64):
-                _linear_64x64(
-                    scratch,
+                _attention_64x32(
+                    q,
+                    k,
+                    v,
                     norm,
+                    valid_base,
+                    trace_ptr + (37 + layer * 8) * E,
+                    trace_ptr + (41 + layer * 8) * E,
+                    trace_ptr + (69 + layer * 4) * E,
+                    trace_ptr + (85 + layer) * E,
+                    64,
+                    head,
+                    S,
+                    D,
+                    HD,
+                    S,
+                    SCALE,
+                    CAPTURE,
+                    SOFTMAX_ALGORITHM,
+                    DIVISION_ALGORITHM,
+                    EXP_ALGORITHM,
+                    ATTENTION_K,
+                    ALL_VALID,
+                )
+            else:
+                for row_start in range(0, S, 64):
+                    _attention_64x32(
+                        q,
+                        k,
+                        v,
+                        norm,
+                        valid_base,
+                        trace_ptr + (37 + layer * 8) * E,
+                        trace_ptr + (41 + layer * 8) * E,
+                        trace_ptr + (69 + layer * 4) * E,
+                        trace_ptr + (85 + layer) * E,
+                        row_start,
+                        head,
+                        S,
+                        D,
+                        HD,
+                        S,
+                        SCALE,
+                        CAPTURE,
+                        SOFTMAX_ALGORITHM,
+                        DIVISION_ALGORITHM,
+                        EXP_ALGORITHM,
+                        ATTENTION_K,
+                        ALL_VALID,
+                    )
+        if USE_BARRIERS:
+            tl.debug_barrier()
+        _trace_tensor(norm, trace_ptr, layer * 9 + 4, E, CAPTURE)
+
+        for row_start in range(0, S, LINEAR_M):
+            for column_start in range(0, D, LINEAR_N):
+                _linear_tile(
+                    norm,
+                    k,
                     weights + JIT_OUT_WEIGHT,
                     weights + JIT_OUT_BIAS,
-                    x,
+                    residual,
                     valid_base,
                     row_start,
                     column_start,
                     D,
                     2,
+                    GELU_ALGORITHM,
+                    LINEAR_K,
+                    LINEAR_M,
+                    LINEAR_N,
+                    ALL_VALID,
                 )
-        tl.debug_barrier()
-        _trace_tensor(norm, trace_ptr, layer * 9 + 5, E, CAPTURE)
+        if USE_BARRIERS:
+            tl.debug_barrier()
+        _trace_tensor(k, trace_ptr, layer * 9 + 5, E, CAPTURE)
 
         for row_start in range(0, S, 64):
             _layer_norm_half(
+                k,
                 norm,
-                x,
                 weights + JIT_NORM2_WEIGHT,
                 weights + JIT_NORM2_BIAS,
                 row_start,
                 D,
                 64,
+                NORM_ALGORITHM,
             )
-        tl.debug_barrier()
-        _trace_tensor(x, trace_ptr, layer * 9 + 6, E, CAPTURE)
+        if USE_BARRIERS:
+            tl.debug_barrier()
+        _trace_tensor(norm, trace_ptr, layer * 9 + 6, E, CAPTURE)
 
-        for row_start in range(0, S, 64):
-            for column_start in range(0, D, 64):
-                _linear_64x64(
-                    x,
-                    scratch,
+        for row_start in range(0, S, LINEAR_M):
+            for column_start in range(0, D, LINEAR_N):
+                _linear_tile(
+                    norm,
+                    v,
                     weights + JIT_FFN_IN_WEIGHT,
                     weights + JIT_FFN_IN_BIAS,
                     norm,
@@ -525,48 +730,84 @@ def _transformer_megakernel(
                     column_start,
                     D,
                     1,
+                    GELU_ALGORITHM,
+                    LINEAR_K,
+                    LINEAR_M,
+                    LINEAR_N,
+                    ALL_VALID,
                 )
-        tl.debug_barrier()
-        _trace_tensor(scratch, trace_ptr, layer * 9 + 7, E, CAPTURE)
+        if USE_BARRIERS:
+            tl.debug_barrier()
+        _trace_tensor(v, trace_ptr, layer * 9 + 7, E, CAPTURE)
 
-        for row_start in range(0, S, 64):
-            for column_start in range(0, D, 64):
-                _linear_64x64(
-                    scratch,
+        for row_start in range(0, S, LINEAR_M):
+            for column_start in range(0, D, LINEAR_N):
+                _linear_tile(
+                    v,
                     x,
                     weights + JIT_FFN_OUT_WEIGHT,
                     weights + JIT_FFN_OUT_BIAS,
-                    norm,
+                    k,
                     valid_base,
                     row_start,
                     column_start,
                     D,
                     3,
+                    GELU_ALGORITHM,
+                    LINEAR_K,
+                    LINEAR_M,
+                    LINEAR_N,
+                    ALL_VALID,
                 )
-        tl.debug_barrier()
+        if USE_BARRIERS:
+            tl.debug_barrier()
         _trace_tensor(x, trace_ptr, layer * 9 + 8, E, CAPTURE)
 
     final_norm_weight = packed_ptr + NUM_LAYERS * LAYER_WEIGHTS
     final_norm_bias = final_norm_weight + D
-    for row_start in range(0, S, 64):
-        _layer_norm_half(
-            x,
-            norm,
-            final_norm_weight,
-            final_norm_bias,
-            row_start,
-            D,
-            64,
-        )
-    tl.debug_barrier()
-    _trace_tensor(norm, trace_ptr, NUM_LAYERS * 9, E, CAPTURE)
-
-    for start in range(0, E, 256):
-        indices = start + offsets
-        rows = indices // D
-        valid = tl.load(valid_base + rows)
-        result = tl.load(norm + indices)
-        tl.store(output_ptr + sequence * E + indices, tl.where(valid, result, 0.0))
+    sequence_output = x
+    if ALL_VALID:
+        for row_start in range(0, S, 64):
+            _layer_norm_half(
+                x,
+                sequence_output,
+                final_norm_weight,
+                final_norm_bias,
+                row_start,
+                D,
+                64,
+                NORM_ALGORITHM,
+            )
+        if CAPTURE:
+            tl.debug_barrier()
+            _trace_tensor(
+                sequence_output, trace_ptr, NUM_LAYERS * 9, E, CAPTURE
+            )
+    else:
+        for row_start in range(0, S, 64):
+            _layer_norm_half(
+                x,
+                norm,
+                final_norm_weight,
+                final_norm_bias,
+                row_start,
+                D,
+                64,
+                NORM_ALGORITHM,
+            )
+        if USE_BARRIERS:
+            tl.debug_barrier()
+        _trace_tensor(norm, trace_ptr, NUM_LAYERS * 9, E, CAPTURE)
+        offsets = tl.arange(0, 256)
+        for start in range(0, E, 256):
+            indices = start + offsets
+            rows = indices // D
+            valid = tl.load(valid_base + rows)
+            result = tl.load(norm + indices)
+            tl.store(
+                sequence_output + indices,
+                tl.where(valid, result, 0.0),
+            )
 
 
 def fused_megakernel_forward(
@@ -575,8 +816,11 @@ def fused_megakernel_forward(
     packed_weights: torch.Tensor,
     *,
     capture_trace: bool = False,
+    all_valid: bool | None = None,
 ):
     batch_size = value.shape[0]
+    if all_valid is None:
+        all_valid = ALL_VALID_TOKENS
     if capture_trace and batch_size != 1:
         raise ValueError("trace capture supports exactly one sequence")
     workspace = torch.empty(
@@ -610,7 +854,19 @@ def fused_megakernel_forward(
         LAYER_WEIGHTS=LAYER_STRIDE,
         SCALE=HEAD_DIM ** -0.5,
         CAPTURE=capture_trace,
-        num_warps=4,
-        num_stages=2,
+        NORM_ALGORITHM=NORM_MODE,
+        SOFTMAX_ALGORITHM=SOFTMAX_MODE,
+        DIVISION_ALGORITHM=DIVISION_MODE,
+        EXP_ALGORITHM=EXP_MODE,
+        GELU_ALGORITHM=GELU_MODE,
+        SKIP_CAUSAL_TILES=CAUSAL_SKIP,
+        LINEAR_K=LINEAR_REDUCTION_TILE,
+        ATTENTION_K=ATTENTION_REDUCTION_TILE,
+        LINEAR_M=LINEAR_ROW_TILE,
+        LINEAR_N=LINEAR_OUTPUT_TILE,
+        ALL_VALID=all_valid,
+        USE_BARRIERS=EXPLICIT_BARRIERS or capture_trace,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
     )
     return (output, trace) if capture_trace else output
