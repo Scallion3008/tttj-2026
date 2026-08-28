@@ -6,6 +6,7 @@ dependencies = [
   "ninja>=1.13.0",
   "torch>=2.8.0",
   "torchvision>=0.23.0",
+  "triton>=3.7.1; sys_platform == 'linux'",
 ]
 
 [tool.uv.sources]

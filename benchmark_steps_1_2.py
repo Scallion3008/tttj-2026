@@ -135,7 +135,8 @@ def make_models(
     baseline = BaselineTransformer(config).cuda().half().eval()
     parameter_model = copy.deepcopy(baseline)
     optimized = SequenceResidentTransformer(
-        parameter_model, verbose_build=verbose_build
+        parameter_model,
+        verbose_build=verbose_build,
     ).cuda().eval()
     optimized.prepare()
     return baseline, optimized, config
@@ -232,6 +233,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--verbose-build", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        choices=(128, 10000),
+        default=(128, 10000),
+    )
     return parser.parse_args()
 
 
@@ -267,7 +275,8 @@ def main() -> int:
                 128: (3, 10, 30, 3),
                 10000: (1, 3, 10, 2),
             }
-        for batch_size, (trials, warmup, repeats, rounds) in settings.items():
+        for batch_size in args.batch_sizes:
+            trials, warmup, repeats, rounds = settings[batch_size]
             passed &= run_case(
                 batch_size,
                 trials,

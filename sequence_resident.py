@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
 
+from fused_megakernel import fused_megakernel_forward
+
 
 SEQUENCE_LENGTH = 128
 MODEL_DIMENSION = 128
@@ -111,7 +113,11 @@ def unpack_debug(debug: torch.Tensor) -> Dict[str, torch.Tensor]:
 class SequenceResidentTransformer(nn.Module):
     """Inference-only adapter around a compatible baseline parameter module."""
 
-    def __init__(self, parameter_model: nn.Module, verbose_build: bool = False) -> None:
+    def __init__(
+        self,
+        parameter_model: nn.Module,
+        verbose_build: bool = False,
+    ) -> None:
         super().__init__()
         self.parameter_model = parameter_model
         self.verbose_build = verbose_build
@@ -122,7 +128,6 @@ class SequenceResidentTransformer(nn.Module):
         if packed.device.type != "cuda" or packed.dtype != torch.float16:
             raise ValueError("parameters must be CUDA float16 before prepare()")
         self.packed_weights = packed
-        load_extension(verbose=self.verbose_build)
 
     def _ensure_prepared(self, x: torch.Tensor) -> None:
         if self.packed_weights is None:
@@ -141,6 +146,13 @@ class SequenceResidentTransformer(nn.Module):
                 x.shape[:2], device=x.device, dtype=torch.bool
             )
         self._ensure_prepared(x)
+        if not capture_debug:
+            return (
+                fused_megakernel_forward(
+                    x, valid_token_mask, self.packed_weights
+                ),
+                None,
+            )
         output, debug = load_extension().forward(
             x.contiguous(),
             valid_token_mask.contiguous(),
