@@ -56,13 +56,13 @@ def main() -> int:
                 rep=args.rep,
                 quantiles=[0.5, 0.2, 0.8],
             )
-            batch, sequence, heads = CASES[case_number]
+            batch, sequence, model, heads = CASES[case_number]
             if is_step_4_shape(value, heads):
                 family = "dag"
                 tuning = resolved_dag_tuning(batch, sequence)
             else:
                 family = "resident"
-                tuning = resolved_megakernel_tuning(batch, heads)
+                tuning = resolved_megakernel_tuning(batch, heads, model)
             print(
                 f"case={case_number:2d} family={family:8s} "
                 f"median={float(median):.6f} ms p20={float(low):.6f} "

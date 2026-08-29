@@ -90,8 +90,21 @@ NUM_WARPS = _environment_integer("TTTJ_NUM_WARPS", 4)
 NUM_STAGES = _environment_integer("TTTJ_NUM_STAGES", 3)
 RESIDENT_ASSIST = bool(_environment_integer("TTTJ_RESIDENT_ASSIST", 1))
 RESIDENT_SPLIT_Q = bool(_environment_integer("TTTJ_RESIDENT_SPLIT_Q", 1))
+HD8_PARALLEL_TAIL = bool(
+    _environment_integer("TTTJ_HD8_PARALLEL_TAIL", 1)
+)
+HD8_PARALLEL_NORM = bool(
+    _environment_integer("TTTJ_HD8_PARALLEL_NORM", 1)
+)
 LINEAR_REDUCTION_TILE = _environment_integer("TTTJ_LINEAR_K", 64)
 ATTENTION_REDUCTION_TILE = _environment_integer("TTTJ_ATTENTION_K", 32)
+# Head-dimension eight is too narrow for an unpadded tensor-core QK tile.
+# Mode 0 performs the eight products explicitly with SIMT FMAs; mode 1 pads
+# the reduction to K16 and lets Hopper's tensor cores discard the zero half.
+HD8_QK_MODE = _environment_integer("TTTJ_HD8_QK_MODE", 1)
+JIT_HD8_QK_MODE = tl.constexpr(HD8_QK_MODE)
+HD8_PV_MODE = _environment_integer("TTTJ_HD8_PV_MODE", 1)
+JIT_HD8_PV_MODE = tl.constexpr(HD8_PV_MODE)
 LINEAR_ROW_TILE = _environment_integer("TTTJ_LINEAR_M", 64)
 ATTENTION_ROW_TILE = _environment_integer("TTTJ_ATTENTION_M", 64)
 NORM_ROW_TILE = _environment_integer("TTTJ_NORM_M", 64)
@@ -108,6 +121,7 @@ ASSIST_SEQUENCES = tl.constexpr(64)
 def resolved_megakernel_tuning(
     batch_size: int,
     num_heads: int,
+    model_dimension: int = MODEL,
 ) -> dict[str, int]:
     """Resolve shape defaults while retaining environment tuning overrides."""
     step_3_shape = batch_size == 64 and NUM_CTAS == 1
@@ -126,13 +140,31 @@ def resolved_megakernel_tuning(
             attention_m = 128
         if not _environment_is_set("TTTJ_ATTENTION_K"):
             attention_k = 64 if num_heads == 2 else 32
+    head_dimension = model_dimension // num_heads
+    if batch_size == 64 and head_dimension == 8:
+        if not _environment_is_set("TTTJ_NUM_WARPS"):
+            num_warps = 8
+        if not _environment_is_set("TTTJ_LINEAR_M"):
+            linear_m = 128
+        if not _environment_is_set("TTTJ_ATTENTION_M"):
+            attention_m = 128
+        if not _environment_is_set("TTTJ_ATTENTION_K"):
+            attention_k = 16
+        if model_dimension == 32 and not _environment_is_set("TTTJ_LINEAR_K"):
+            # cuBLAS's D32 GEMMs expose two K16 accumulation fragments. The
+            # explicit boundary is required for the strict end-to-end gate.
+            linear_k = 16
+        else:
+            linear_k = LINEAR_REDUCTION_TILE
+    else:
+        linear_k = LINEAR_REDUCTION_TILE
     if batch_size >= 10000 and not _environment_is_set("TTTJ_NUM_STAGES"):
         num_stages = 2
     return {
         "num_warps": num_warps,
         "num_stages": num_stages,
         "linear_m": linear_m,
-        "linear_k": LINEAR_REDUCTION_TILE,
+        "linear_k": linear_k,
         "attention_m": attention_m,
         "attention_k": attention_k,
         "norm_m": norm_m,
@@ -323,8 +355,9 @@ def _layer_norm_half(
     if NORM_ALGORITHM == 0:
         # PyTorch's aligned FP16 LayerNorm assigns one half4 to each lane and
         # reduces the 32 per-lane Welford accumulators with shfl_down.
-        lane_values = tl.reshape(values, (ROWS, 32, 4))
-        lane_pairs = tl.reshape(lane_values, (ROWS, 32, 2, 2))
+        norm_lanes: tl.constexpr = D // 4
+        lane_values = tl.reshape(values, (ROWS, norm_lanes, 4))
+        lane_pairs = tl.reshape(lane_values, (ROWS, norm_lanes, 2, 2))
         even, odd = tl.split(lane_pairs)
         item0, item2 = tl.split(even)
         item1, item3 = tl.split(odd)
@@ -335,12 +368,13 @@ def _layer_norm_half(
         mean, sigma2, count = _welford_online(item1, mean, sigma2, count)
         mean, sigma2, count = _welford_online(item2, mean, sigma2, count)
         mean, sigma2, count = _welford_online(item3, mean, sigma2, count)
-        mean, sigma2, count = _welford_combine_halves(
-            mean, sigma2, count, ROWS, 32
-        )
-        mean, sigma2, count = _welford_combine_halves(
-            mean, sigma2, count, ROWS, 16
-        )
+        if norm_lanes == 32:
+            mean, sigma2, count = _welford_combine_halves(
+                mean, sigma2, count, ROWS, 32
+            )
+            mean, sigma2, count = _welford_combine_halves(
+                mean, sigma2, count, ROWS, 16
+            )
         mean, sigma2, count = _welford_combine_halves(
             mean, sigma2, count, ROWS, 8
         )
@@ -535,24 +569,59 @@ def _attention_mxhd(
 ):
     queries = row_start + tl.arange(0, ROW_TILE)
     keys = tl.arange(0, K)
-    reductions = tl.arange(0, REDUCTION_TILE)
     scores = tl.zeros((ROW_TILE, K), dtype=tl.float32)
-    for reduction_start in range(0, HD, REDUCTION_TILE):
-        query_tile = tl.load(
-            q_ptr
-            + queries[:, None] * D
-            + head * HD
-            + reduction_start
-            + reductions[None, :]
-        )
-        key_tile = tl.load(
-            k_ptr
-            + keys[None, :] * D
-            + head * HD
-            + reduction_start
-            + reductions[:, None]
-        )
-        scores = tl.dot(query_tile, key_tile, scores)
+    if HD == 8:
+        if JIT_HD8_QK_MODE == 0:
+            # A true SIMT K8 product avoids doing the padded half of a K16
+            # MMA. Keeping the reduction scalar also preserves K order.
+            for reduction in range(0, HD):
+                query_value = tl.load(
+                    q_ptr + queries * D + head * HD + reduction
+                )
+                key_value = tl.load(
+                    k_ptr + keys * D + head * HD + reduction
+                )
+                scores += query_value[:, None] * key_value[None, :]
+        else:
+            # Hopper tensor-core instructions require K16. The upper eight
+            # lanes are explicit zero padding and cannot read the next head.
+            reductions = tl.arange(0, 16)
+            reduction_mask = reductions < HD
+            query_tile = tl.load(
+                q_ptr
+                + queries[:, None] * D
+                + head * HD
+                + reductions[None, :],
+                mask=reduction_mask[None, :],
+                other=0.0,
+            )
+            key_tile = tl.load(
+                k_ptr
+                + keys[None, :] * D
+                + head * HD
+                + reductions[:, None],
+                mask=reduction_mask[:, None],
+                other=0.0,
+            )
+            scores = tl.dot(query_tile, key_tile, scores)
+    else:
+        reductions = tl.arange(0, REDUCTION_TILE)
+        for reduction_start in range(0, HD, REDUCTION_TILE):
+            query_tile = tl.load(
+                q_ptr
+                + queries[:, None] * D
+                + head * HD
+                + reduction_start
+                + reductions[None, :]
+            )
+            key_tile = tl.load(
+                k_ptr
+                + keys[None, :] * D
+                + head * HD
+                + reduction_start
+                + reductions[:, None]
+            )
+            scores = tl.dot(query_tile, key_tile, scores)
 
     # Preserve the reference's FP16 QK output boundary and FP32 scalar scale.
     scores = scores.to(tl.float16).to(tl.float32) * SCALE
@@ -662,13 +731,39 @@ def _attention_mxhd(
     # HD is 32, 64, or 128 for benchmark cases 1, 10, and 9.  Emitting the
     # whole head in one dot gives Hopper a natural WGMMA N tile and avoids
     # repeating the probability load/softmax for multiple 32-column slices.
-    value_columns = tl.arange(0, HD)
-    value_tile = tl.load(
-        v_ptr
-        + keys[:, None] * D
-        + head * HD
-        + value_columns[None, :]
-    )
+    if HD == 8:
+        if JIT_HD8_PV_MODE == 0:
+            value_columns = tl.arange(0, HD)
+            value_mask = value_columns < HD
+            value_tile = tl.load(
+                v_ptr
+                + keys[:, None] * D
+                + head * HD
+                + value_columns[None, :]
+            )
+        else:
+            # Pad to N16 to retain the reference accumulation/rounding path.
+            # A native N8 dot is slightly faster, but fails the strict gate at
+            # small input scales. Only the low eight columns are stored.
+            value_columns = tl.arange(0, 16)
+            value_mask = value_columns < HD
+            value_tile = tl.load(
+                v_ptr
+                + keys[:, None] * D
+                + head * HD
+                + value_columns[None, :],
+                mask=value_mask[None, :],
+                other=0.0,
+            )
+    else:
+        value_columns = tl.arange(0, HD)
+        value_mask = value_columns < HD
+        value_tile = tl.load(
+            v_ptr
+            + keys[:, None] * D
+            + head * HD
+            + value_columns[None, :]
+        )
     if JIT_PV_MODE == 1 and K == 32:
         # cuBLAS's S32 strided-batched GEMM accumulates two K16 fragments.
         # Make that boundary explicit rather than letting WGMMA select a
@@ -691,6 +786,7 @@ def _attention_mxhd(
         + head * HD
         + value_columns[None, :],
         context,
+        mask=value_mask[None, :],
     )
 
 
@@ -922,6 +1018,149 @@ def _cluster_attention_128x32(
 
 
 @triton.jit
+def _hd8_resident_parallel_tail(
+    context_ptr,
+    norm_ptr,
+    k_ptr,
+    v_ptr,
+    output_ptr,
+    weights_ptr,
+    residual_ptr,
+    valid_ptr,
+    packed_ptr,
+    row_start,
+    D: tl.constexpr,
+    LINEAR_K: tl.constexpr,
+    GELU_ALGORITHM: tl.constexpr,
+    ALL_VALID: tl.constexpr,
+    FINAL_LAYER: tl.constexpr,
+    NUM_LAYERS: tl.constexpr,
+    LAYER_WEIGHTS: tl.constexpr,
+):
+    q_weight_offset: tl.constexpr = 2 * D
+    q_bias_offset: tl.constexpr = q_weight_offset + D * D
+    k_weight_offset: tl.constexpr = q_bias_offset + D
+    k_bias_offset: tl.constexpr = k_weight_offset + D * D
+    v_weight_offset: tl.constexpr = k_bias_offset + D
+    v_bias_offset: tl.constexpr = v_weight_offset + D * D
+    out_weight_offset: tl.constexpr = v_bias_offset + D
+    out_bias_offset: tl.constexpr = out_weight_offset + D * D
+    norm2_weight_offset: tl.constexpr = out_bias_offset + D
+    norm2_bias_offset: tl.constexpr = norm2_weight_offset + D
+    ffn_in_weight_offset: tl.constexpr = norm2_bias_offset + D
+    ffn_in_bias_offset: tl.constexpr = ffn_in_weight_offset + D * D
+    ffn_out_weight_offset: tl.constexpr = ffn_in_bias_offset + D
+    ffn_out_bias_offset: tl.constexpr = ffn_out_weight_offset + D * D
+    _linear_tile(
+        context_ptr,
+        k_ptr,
+        weights_ptr + out_weight_offset,
+        weights_ptr + out_bias_offset,
+        residual_ptr,
+        valid_ptr,
+        row_start,
+        0,
+        D,
+        2,
+        GELU_ALGORITHM,
+        LINEAR_K,
+        64,
+        D,
+        ALL_VALID,
+    )
+    tl.debug_barrier()
+    _layer_norm_half(
+        k_ptr,
+        norm_ptr,
+        norm_ptr,
+        weights_ptr + norm2_weight_offset,
+        weights_ptr + norm2_bias_offset,
+        row_start,
+        D,
+        64,
+        0,
+        False,
+    )
+    tl.debug_barrier()
+    _linear_tile(
+        norm_ptr,
+        v_ptr,
+        weights_ptr + ffn_in_weight_offset,
+        weights_ptr + ffn_in_bias_offset,
+        norm_ptr,
+        valid_ptr,
+        row_start,
+        0,
+        D,
+        1,
+        GELU_ALGORITHM,
+        LINEAR_K,
+        64,
+        D,
+        ALL_VALID,
+    )
+    tl.debug_barrier()
+    _linear_tile(
+        v_ptr,
+        output_ptr,
+        weights_ptr + ffn_out_weight_offset,
+        weights_ptr + ffn_out_bias_offset,
+        k_ptr,
+        valid_ptr,
+        row_start,
+        0,
+        D,
+        3,
+        GELU_ALGORITHM,
+        LINEAR_K,
+        64,
+        D,
+        ALL_VALID,
+    )
+    tl.debug_barrier()
+    if FINAL_LAYER:
+        final_weight = packed_ptr + NUM_LAYERS * LAYER_WEIGHTS
+        final_bias = final_weight + D
+        if ALL_VALID:
+            _layer_norm_half(
+                output_ptr,
+                output_ptr,
+                output_ptr,
+                final_weight,
+                final_bias,
+                row_start,
+                D,
+                64,
+                0,
+                False,
+            )
+        else:
+            _layer_norm_half(
+                output_ptr,
+                norm_ptr,
+                norm_ptr,
+                final_weight,
+                final_bias,
+                row_start,
+                D,
+                64,
+                0,
+                False,
+            )
+            tl.debug_barrier()
+            rows = row_start + tl.arange(0, 64)
+            columns = tl.arange(0, D)
+            values = tl.load(
+                norm_ptr + rows[:, None] * D + columns[None, :]
+            )
+            valid = tl.load(valid_ptr + rows)[:, None]
+            tl.store(
+                output_ptr + rows[:, None] * D + columns[None, :],
+                tl.where(valid, values, 0.0),
+            )
+
+
+@triton.jit
 def _transformer_megakernel(
     input_ptr,
     valid_ptr,
@@ -960,7 +1199,27 @@ def _transformer_megakernel(
     ASSIST: tl.constexpr,
     ASSIST_THREADS: tl.constexpr,
     SPLIT_ASSIST_Q: tl.constexpr,
+    PARALLEL_HD8_TAIL: tl.constexpr,
+    PARALLEL_HD8_NORM: tl.constexpr,
 ):
+    # The packed layout is identical for every D=F specialization; derive its
+    # compile-time offsets here so D32 and D128 share the same kernel body.
+    norm1_weight_offset: tl.constexpr = 0
+    norm1_bias_offset: tl.constexpr = D
+    q_weight_offset: tl.constexpr = 2 * D
+    q_bias_offset: tl.constexpr = q_weight_offset + D * D
+    k_weight_offset: tl.constexpr = q_bias_offset + D
+    k_bias_offset: tl.constexpr = k_weight_offset + D * D
+    v_weight_offset: tl.constexpr = k_bias_offset + D
+    v_bias_offset: tl.constexpr = v_weight_offset + D * D
+    out_weight_offset: tl.constexpr = v_bias_offset + D
+    out_bias_offset: tl.constexpr = out_weight_offset + D * D
+    norm2_weight_offset: tl.constexpr = out_bias_offset + D
+    norm2_bias_offset: tl.constexpr = norm2_weight_offset + D
+    ffn_in_weight_offset: tl.constexpr = norm2_bias_offset + D
+    ffn_in_bias_offset: tl.constexpr = ffn_in_weight_offset + D * D
+    ffn_out_weight_offset: tl.constexpr = ffn_in_bias_offset + D
+    ffn_out_bias_offset: tl.constexpr = ffn_out_weight_offset + D * D
     worker = tl.program_id(0)
     if ASSIST:
         sequence = worker // 2
@@ -1031,24 +1290,45 @@ def _transformer_megakernel(
             attention_residual = saved_residual
         else:
             attention_residual = residual
+        if PARALLEL_HD8_NORM:
+            _layer_norm_half(
+                residual,
+                norm,
+                norm,
+                weights + norm1_weight_offset,
+                weights + norm1_bias_offset,
+                role * 64,
+                D,
+                64,
+                NORM_ALGORITHM,
+                False,
+            )
+            _resident_publish(ASSIST_THREADS)
+            tl.atomic_add(
+                norm_epochs + sequence, 1, sem="release", scope="gpu"
+            )
+            norm_ready = _resident_acquire(norm_epochs + sequence)
+            while norm_ready < 2 * (layer + 1):
+                norm_ready = _resident_acquire(norm_epochs + sequence)
         if role == 0:
-            for row_start in range(0, S, NORM_M):
-                _layer_norm_half(
-                    residual,
-                    norm,
-                    saved_residual,
-                    weights + JIT_NORM1_WEIGHT,
-                    weights + JIT_NORM1_BIAS,
-                    row_start,
-                    D,
-                    NORM_M,
-                    NORM_ALGORITHM,
-                    CLUSTERED,
-                )
-            if USE_BARRIERS or CLUSTERED:
-                _stage_barrier(CLUSTERED)
+            if not PARALLEL_HD8_NORM:
+                for row_start in range(0, S, NORM_M):
+                    _layer_norm_half(
+                        residual,
+                        norm,
+                        saved_residual,
+                        weights + norm1_weight_offset,
+                        weights + norm1_bias_offset,
+                        row_start,
+                        D,
+                        NORM_M,
+                        NORM_ALGORITHM,
+                        CLUSTERED,
+                    )
+                if USE_BARRIERS or CLUSTERED:
+                    _stage_barrier(CLUSTERED)
             _trace_tensor(norm, trace_ptr, layer * 9, E, CAPTURE)
-            if ASSIST:
+            if ASSIST and not PARALLEL_HD8_NORM:
                 _resident_publish(ASSIST_THREADS)
                 tl.atomic_xchg(
                     norm_epochs + sequence,
@@ -1063,8 +1343,8 @@ def _transformer_megakernel(
                         _linear_tile(
                             norm,
                             k,
-                            weights + JIT_K_WEIGHT,
-                            weights + JIT_K_BIAS,
+                            weights + k_weight_offset,
+                            weights + k_bias_offset,
                             residual,
                             valid_base,
                             row_start,
@@ -1080,8 +1360,8 @@ def _transformer_megakernel(
                     _linear_tile(
                         norm,
                         v,
-                        weights + JIT_V_WEIGHT,
-                        weights + JIT_V_BIAS,
+                        weights + v_weight_offset,
+                        weights + v_bias_offset,
                         residual,
                         valid_base,
                         row_start,
@@ -1109,8 +1389,8 @@ def _transformer_megakernel(
                     _linear_tile(
                         norm,
                         q,
-                        weights + JIT_Q_WEIGHT,
-                        weights + JIT_Q_BIAS,
+                        weights + q_weight_offset,
+                        weights + q_bias_offset,
                         residual,
                         valid_base,
                         row_start,
@@ -1120,7 +1400,7 @@ def _transformer_megakernel(
                         GELU_ALGORITHM,
                         LINEAR_K,
                         LINEAR_M,
-                        64 if SPLIT_ASSIST_Q else LINEAR_N,
+                        D // 2 if SPLIT_ASSIST_Q else LINEAR_N,
                         ALL_VALID,
                     )
             if USE_BARRIERS or CLUSTERED:
@@ -1145,16 +1425,17 @@ def _transformer_megakernel(
                         scope="gpu",
                     )
         elif ASSIST:
-            norm_ready = _resident_acquire(norm_epochs + sequence)
-            while norm_ready < layer + 1:
+            if not PARALLEL_HD8_NORM:
                 norm_ready = _resident_acquire(norm_epochs + sequence)
+                while norm_ready < layer + 1:
+                    norm_ready = _resident_acquire(norm_epochs + sequence)
             for row_start in range(0, S, LINEAR_M):
                 for column_start in range(0, D, LINEAR_N):
                     _linear_tile(
                         norm,
                         k,
-                        weights + JIT_K_WEIGHT,
-                        weights + JIT_K_BIAS,
+                        weights + k_weight_offset,
+                        weights + k_bias_offset,
                         residual,
                         valid_base,
                         row_start,
@@ -1182,18 +1463,18 @@ def _transformer_megakernel(
                     _linear_tile(
                         norm,
                         q,
-                        weights + JIT_Q_WEIGHT,
-                        weights + JIT_Q_BIAS,
+                        weights + q_weight_offset,
+                        weights + q_bias_offset,
                         residual,
                         valid_base,
                         row_start,
-                        64,
+                        D // 2,
                         D,
                         0,
                         GELU_ALGORITHM,
                         LINEAR_K,
                         LINEAR_M,
-                        64,
+                        D // 2,
                         ALL_VALID,
                     )
                 _resident_publish(ASSIST_THREADS)
@@ -1347,7 +1628,21 @@ def _transformer_megakernel(
                         )
         if ASSIST:
             _resident_publish(ASSIST_THREADS)
-            if role == 1:
+            if PARALLEL_HD8_TAIL:
+                tl.atomic_add(
+                    attention_epochs + sequence,
+                    1,
+                    sem="release",
+                    scope="gpu",
+                )
+                attention_done = _resident_acquire(
+                    attention_epochs + sequence
+                )
+                while attention_done < 2 * (layer + 1):
+                    attention_done = _resident_acquire(
+                        attention_epochs + sequence
+                    )
+            elif role == 1:
                 tl.atomic_xchg(
                     attention_epochs + sequence,
                     layer + 1,
@@ -1367,17 +1662,48 @@ def _transformer_megakernel(
                     )
         elif USE_BARRIERS and not CLUSTERED:
             _stage_barrier(CLUSTERED)
-        if role == 0:
+        if PARALLEL_HD8_TAIL:
+            _hd8_resident_parallel_tail(
+                context,
+                norm,
+                k,
+                v,
+                x,
+                weights,
+                attention_residual,
+                valid_base,
+                packed_ptr,
+                role * 64,
+                D,
+                LINEAR_K,
+                GELU_ALGORITHM,
+                ALL_VALID,
+                layer == NUM_LAYERS - 1,
+                NUM_LAYERS,
+                LAYER_WEIGHTS,
+            )
+            _resident_publish(ASSIST_THREADS)
+            tl.atomic_add(
+                layer_epochs + sequence,
+                1,
+                sem="release",
+                scope="gpu",
+            )
+            layer_done = _resident_acquire(layer_epochs + sequence)
+            while layer_done < 2 * (layer + 1):
+                layer_done = _resident_acquire(layer_epochs + sequence)
+
+        if role == 0 and not PARALLEL_HD8_TAIL:
             _trace_tensor(context, trace_ptr, layer * 9 + 4, E, CAPTURE)
 
-        if role == 0:
+        if role == 0 and not PARALLEL_HD8_TAIL:
             for row_start in range(0, S, LINEAR_M):
                 for column_start in range(0, D, LINEAR_N):
                     _linear_tile(
                         context,
                         k,
-                        weights + JIT_OUT_WEIGHT,
-                        weights + JIT_OUT_BIAS,
+                        weights + out_weight_offset,
+                        weights + out_bias_offset,
                         attention_residual,
                         valid_base,
                         row_start,
@@ -1399,8 +1725,8 @@ def _transformer_megakernel(
                     k,
                     norm,
                     norm,
-                    weights + JIT_NORM2_WEIGHT,
-                    weights + JIT_NORM2_BIAS,
+                    weights + norm2_weight_offset,
+                    weights + norm2_bias_offset,
                     row_start,
                     D,
                     NORM_M,
@@ -1416,8 +1742,8 @@ def _transformer_megakernel(
                     _linear_tile(
                         norm,
                         v,
-                        weights + JIT_FFN_IN_WEIGHT,
-                        weights + JIT_FFN_IN_BIAS,
+                        weights + ffn_in_weight_offset,
+                        weights + ffn_in_bias_offset,
                         norm,
                         valid_base,
                         row_start,
@@ -1443,8 +1769,8 @@ def _transformer_megakernel(
                     _linear_tile(
                         v,
                         ffn_output,
-                        weights + JIT_FFN_OUT_WEIGHT,
-                        weights + JIT_FFN_OUT_BIAS,
+                        weights + ffn_out_weight_offset,
+                        weights + ffn_out_bias_offset,
                         k,
                         valid_base,
                         row_start,
@@ -1468,7 +1794,7 @@ def _transformer_megakernel(
                     scope="gpu",
                 )
 
-    if role == 0:
+    if role == 0 and not PARALLEL_HD8_TAIL:
         final_norm_weight = packed_ptr + NUM_LAYERS * LAYER_WEIGHTS
         final_norm_bias = final_norm_weight + D
         sequence_output = x
@@ -1543,14 +1869,32 @@ def fused_megakernel_forward(
     launch_epoch: int = 0,
 ):
     batch_size = value.shape[0]
-    use_assist = RESIDENT_ASSIST and batch_size == 64 and num_heads in (2, 4)
-    split_assist_q = use_assist and num_heads == 2 and RESIDENT_SPLIT_Q
+    model_dimension = value.shape[2]
+    head_dim = model_dimension // num_heads
+    use_assist = RESIDENT_ASSIST and batch_size == 64 and (
+        num_heads in (2, 4) or head_dim == 8
+    )
+    split_assist_q = (
+        use_assist
+        and (num_heads == 2 or head_dim == 8)
+        and RESIDENT_SPLIT_Q
+    )
     if all_valid is None:
         all_valid = ALL_VALID_TOKENS
-    if num_heads not in (1, 2, 4):
-        raise ValueError(f"supported head counts are 1, 2, and 4; got {num_heads}")
-    head_dim = MODEL // num_heads
-    if capture_trace and (batch_size != 1 or num_heads != DEFAULT_HEADS):
+    if (
+        model_dimension not in (32, 128)
+        or model_dimension % num_heads
+        or head_dim not in (8, 32, 64, 128)
+    ):
+        raise ValueError(
+            "supported shapes have D in {32,128} and head dimension in "
+            f"{{8,32,64,128}}; got D={model_dimension}, H={num_heads}"
+        )
+    if capture_trace and (
+        batch_size != 1
+        or model_dimension != MODEL
+        or num_heads != DEFAULT_HEADS
+    ):
         raise ValueError("trace capture supports one sequence with four heads")
     if NUM_CTAS > 1 and num_heads != DEFAULT_HEADS:
         raise ValueError("the experimental clustered path supports four heads only")
@@ -1565,32 +1909,36 @@ def fused_megakernel_forward(
         or scheduler.numel() < 7 * 64
     ):
         raise ValueError("resident attention assist requires an int32 scheduler")
-    tuning = resolved_megakernel_tuning(batch_size, num_heads)
+    tuning = resolved_megakernel_tuning(
+        batch_size, num_heads, model_dimension
+    )
     if SEQUENCE % tuning["linear_m"] != 0:
         raise ValueError("TTTJ_LINEAR_M must divide 128")
     if SEQUENCE % tuning["attention_m"] != 0:
         raise ValueError("TTTJ_ATTENTION_M must divide 128")
     if SEQUENCE % tuning["norm_m"] != 0:
         raise ValueError("TTTJ_NORM_M must divide 128")
-    if (
+    if head_dim != 8 and (
         tuning["attention_k"] > head_dim
         or head_dim % tuning["attention_k"] != 0
     ):
         raise ValueError("TTTJ_ATTENTION_K must divide and not exceed head_dim")
+    if head_dim == 8 and tuning["attention_k"] != 16:
+        raise ValueError("head-dimension-8 attention uses a padded K16 tile")
     workspace_slots = (
         CLUSTER_WORKSPACE_SLOTS
         if NUM_CTAS > 1 or use_assist
         else WORKSPACE_SLOTS
     )
     workspace = torch.empty(
-        (batch_size, workspace_slots, SEQUENCE, MODEL),
+        (batch_size, workspace_slots, SEQUENCE, model_dimension),
         device=value.device,
         dtype=value.dtype,
     )
     output = torch.empty_like(value)
     trace = (
         torch.empty(
-            (TRACE_SLOTS, SEQUENCE, MODEL),
+            (TRACE_SLOTS, SEQUENCE, model_dimension),
             device=value.device,
             dtype=torch.float32,
         )
@@ -1609,12 +1957,15 @@ def fused_megakernel_forward(
         scheduler_argument,
         launch_epoch,
         S=SEQUENCE,
-        D=MODEL,
+        D=model_dimension,
         H=num_heads,
         HD=head_dim,
         NUM_LAYERS=LAYERS,
-        E=ELEMENTS,
-        LAYER_WEIGHTS=LAYER_STRIDE,
+        E=SEQUENCE * model_dimension,
+        LAYER_WEIGHTS=(
+            4 * model_dimension
+            + 6 * (model_dimension * model_dimension + model_dimension)
+        ),
         SCALE=head_dim ** -0.5,
         CAPTURE=capture_trace,
         NORM_ALGORITHM=NORM_MODE,
@@ -1628,7 +1979,7 @@ def fused_megakernel_forward(
         ATTENTION_K=tuning["attention_k"],
         ATTENTION_M=tuning["attention_m"],
         LINEAR_M=tuning["linear_m"],
-        LINEAR_N=LINEAR_OUTPUT_TILE,
+        LINEAR_N=model_dimension,
         NORM_M=tuning["norm_m"],
         WORKSPACE_STRIDE=workspace_slots,
         ALL_VALID=all_valid,
@@ -1637,6 +1988,12 @@ def fused_megakernel_forward(
         ASSIST=use_assist,
         ASSIST_THREADS=tuning["num_warps"] * 32,
         SPLIT_ASSIST_Q=split_assist_q,
+        PARALLEL_HD8_TAIL=(
+            use_assist and head_dim == 8 and HD8_PARALLEL_TAIL
+        ),
+        PARALLEL_HD8_NORM=(
+            use_assist and head_dim == 8 and HD8_PARALLEL_NORM
+        ),
         num_warps=tuning["num_warps"],
         num_ctas=NUM_CTAS,
         num_stages=tuning["num_stages"],

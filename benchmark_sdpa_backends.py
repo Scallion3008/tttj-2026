@@ -33,11 +33,15 @@ def main() -> int:
     parser.add_argument("--cases", nargs="+", type=int, choices=CASES, default=CASES)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--rep", type=int, default=300)
+    parser.add_argument("--allow-h200", action="store_true")
     args = parser.parse_args()
 
     properties = torch.cuda.get_device_properties(0)
-    if (properties.major, properties.minor) != (9, 0) or "H100" not in properties.name:
-        raise RuntimeError(f"an H100 sm_90 GPU is required, got {properties.name}")
+    allowed_name = "H100" in properties.name or (
+        args.allow_h200 and "H200" in properties.name
+    )
+    if (properties.major, properties.minor) != (9, 0) or not allowed_name:
+        raise RuntimeError(f"an H100/H200 sm_90 GPU is required, got {properties.name}")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     print(
@@ -47,13 +51,13 @@ def main() -> int:
 
     with torch.inference_mode():
         for case_number in dict.fromkeys(args.cases):
-            batch, sequence, heads = CASES[case_number]
+            batch, sequence, model_dimension, heads = CASES[case_number]
             config = TransformerConfig(
                 batch_size=batch,
                 seq_len=sequence,
-                d_model=128,
+                d_model=model_dimension,
                 num_heads=heads,
-                ffn_dim=128,
+                ffn_dim=model_dimension,
                 num_layers=4,
                 causal=True,
             )
@@ -69,7 +73,14 @@ def main() -> int:
                 1.0,
             )
             results: dict[str, float] = {}
-            for name in ("auto", *BACKENDS):
+            # xgpk0's H200 image lacks cuDNN's runtime-compiled engines; even
+            # probing auto/cuDNN can terminate the process instead of raising.
+            backend_names = (
+                ("flash", "efficient", "math")
+                if "H200" in properties.name
+                else ("auto", *BACKENDS)
+            )
+            for name in backend_names:
                 context = nullcontext() if name == "auto" else sdpa_kernel(BACKENDS[name])
                 try:
                     with context:

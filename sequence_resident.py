@@ -72,7 +72,7 @@ def _append_linear(tensors: list[torch.Tensor], linear: nn.Linear) -> None:
 
 
 def pack_model_weights(model: nn.Module) -> torch.Tensor:
-    """Pack the fixed D128/F128/L4 parameter layout contiguously."""
+    """Pack the fixed D=F, four-layer parameter layout contiguously."""
     config = model.config
     actual = (
         config.d_model,
@@ -82,14 +82,16 @@ def pack_model_weights(model: nn.Module) -> torch.Tensor:
         config.causal,
     )
     if (
-        config.d_model != 128
-        or config.num_heads not in (1, 2, 4)
-        or config.ffn_dim != 128
+        config.d_model not in (32, 128)
+        or config.d_model % config.num_heads
+        or config.d_model // config.num_heads not in (8, 32, 64, 128)
+        or config.ffn_dim != config.d_model
         or config.num_layers != 4
         or not config.causal
     ):
         raise ValueError(
-            "sequence-resident v1 only supports D=128, H in {1,2,4}, F=128, "
+            "sequence-resident v1 supports D=F in {32,128} with head "
+            "dimension in {8,32,64,128}, "
             f"L=4, causal=True; got {actual}"
         )
 

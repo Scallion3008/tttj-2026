@@ -24,21 +24,23 @@ from torch_transformer_benchmark import (
 
 
 CASES = {
-    1: (64, 128, 4),
-    2: (1, 128, 4),
-    3: (4, 128, 4),
-    4: (16, 128, 4),
-    5: (128, 128, 4),
-    6: (10000, 128, 4),
-    9: (64, 128, 1),
-    10: (64, 128, 2),
-    12: (64, 32, 4),
+    1: (64, 128, 128, 4),
+    2: (1, 128, 128, 4),
+    3: (4, 128, 128, 4),
+    4: (16, 128, 128, 4),
+    5: (128, 128, 128, 4),
+    6: (10000, 128, 128, 4),
+    7: (64, 128, 32, 4),
+    9: (64, 128, 128, 1),
+    10: (64, 128, 128, 2),
+    11: (64, 128, 128, 16),
+    12: (64, 32, 128, 4),
 }
 
 
 def make_case(case_number: int):
-    batch, sequence, heads = CASES[case_number]
-    if sequence == 128:
+    batch, sequence, model, heads = CASES[case_number]
+    if sequence == 128 and model == 128 and heads in (1, 2, 4):
         _, optimized, config = make_models(
             batch, 1234, False, num_heads=heads
         )
@@ -47,9 +49,9 @@ def make_case(case_number: int):
     config = TransformerConfig(
         batch_size=batch,
         seq_len=sequence,
-        d_model=128,
+        d_model=model,
         num_heads=heads,
-        ffn_dim=128,
+        ffn_dim=model,
         num_layers=4,
         causal=True,
     )

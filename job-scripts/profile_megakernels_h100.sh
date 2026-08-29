@@ -34,7 +34,7 @@ profile_sections=(
     --section WarpStateStats
 )
 
-for case_number in ${PROFILE_CASES:-5 6 1 9 10 2 3 4 12}; do
+for case_number in ${PROFILE_CASES:-5 6 1 9 10 2 3 4 12 7 11}; do
     if [[ "${case_number}" == "2" || "${case_number}" == "3" || \
           "${case_number}" == "4" || "${case_number}" == "12" ]]; then
         kernel_regex=_static_sequence_dag_megakernel
