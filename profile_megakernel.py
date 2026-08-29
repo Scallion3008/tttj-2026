@@ -15,6 +15,7 @@ import copy
 import torch
 
 from benchmark_steps_1_2 import make_models
+from layerwise_hybrid import Case8OptimizedTransformer
 from sequence_resident import SequenceResidentTransformer
 from torch_transformer_benchmark import (
     BaselineTransformer,
@@ -31,6 +32,7 @@ CASES = {
     5: (128, 128, 128, 4),
     6: (10000, 128, 128, 4),
     7: (64, 128, 32, 4),
+    8: (64, 128, 1024, 4),
     9: (64, 128, 128, 1),
     10: (64, 128, 128, 2),
     11: (64, 128, 128, 16),
@@ -57,8 +59,11 @@ def make_case(case_number: int):
     )
     torch.manual_seed(1234)
     baseline = BaselineTransformer(config).cuda().half().eval()
-    optimized = SequenceResidentTransformer(copy.deepcopy(baseline)).cuda().eval()
-    optimized.prepare()
+    if case_number == 8:
+        optimized = Case8OptimizedTransformer(copy.deepcopy(baseline)).cuda().eval()
+    else:
+        optimized = SequenceResidentTransformer(copy.deepcopy(baseline)).cuda().eval()
+        optimized.prepare()
     return optimized, config
 
 

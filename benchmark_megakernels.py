@@ -8,6 +8,7 @@ import argparse
 import torch
 import triton
 
+from case8_attention import attention_tuning
 from dag_megakernel import is_step_4_shape, resolved_dag_tuning
 from fused_megakernel import resolved_megakernel_tuning
 from profile_megakernel import CASES, make_case
@@ -57,7 +58,10 @@ def main() -> int:
                 quantiles=[0.5, 0.2, 0.8],
             )
             batch, sequence, model, heads = CASES[case_number]
-            if is_step_4_shape(value, heads):
+            if case_number == 8:
+                family = "hybrid"
+                tuning = attention_tuning()
+            elif is_step_4_shape(value, heads):
                 family = "dag"
                 tuning = resolved_dag_tuning(batch, sequence)
             else:
