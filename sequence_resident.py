@@ -9,6 +9,11 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
 
+from dag_megakernel import (
+    SCHEDULER_ELEMENTS,
+    dag_megakernel_forward,
+    is_step_4_shape,
+)
 from fused_megakernel import fused_megakernel_forward
 
 
@@ -127,15 +132,20 @@ class SequenceResidentTransformer(nn.Module):
         self.parameter_model = parameter_model
         self.verbose_build = verbose_build
         self.register_buffer("packed_weights", None, persistent=False)
+        self.register_buffer("dag_scheduler", None, persistent=False)
         self._last_valid_token_mask: Optional[torch.Tensor] = None
         self._last_valid_token_mask_version: Optional[int] = None
         self._last_mask_was_all_valid = False
+        self._dag_epoch = 0
 
     def prepare(self) -> None:
         packed = pack_model_weights(self.parameter_model)
         if packed.device.type != "cuda" or packed.dtype != torch.float16:
             raise ValueError("parameters must be CUDA float16 before prepare()")
         self.packed_weights = packed
+        self.dag_scheduler = torch.zeros(
+            SCHEDULER_ELEMENTS, device=packed.device, dtype=torch.int32
+        )
 
     def _ensure_prepared(self, x: torch.Tensor) -> None:
         if self.packed_weights is None:
@@ -178,16 +188,27 @@ class SequenceResidentTransformer(nn.Module):
                 self._last_mask_was_all_valid = bool(
                     valid_token_mask.all().item()
                 )
-            return (
-                fused_megakernel_forward(
+            if is_step_4_shape(x, num_heads):
+                if self.dag_scheduler is None:
+                    raise RuntimeError("prepare() did not create the DAG scheduler")
+                self._dag_epoch += 1
+                output = dag_megakernel_forward(
+                    x,
+                    valid_token_mask,
+                    self.packed_weights,
+                    self.dag_scheduler,
+                    self._dag_epoch,
+                    all_valid=self._last_mask_was_all_valid,
+                )
+            else:
+                output = fused_megakernel_forward(
                     x,
                     valid_token_mask,
                     self.packed_weights,
                     num_heads=num_heads,
                     all_valid=self._last_mask_was_all_valid,
-                ),
-                None,
-            )
+                )
+            return output, None
         output, debug = load_extension().forward(
             x.contiguous(),
             valid_token_mask.contiguous(),

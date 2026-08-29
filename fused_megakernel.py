@@ -82,6 +82,8 @@ SOFTMAX_MODE = _environment_integer(
 )
 DIVISION_MODE = _environment_integer("TTTJ_DIVISION_MODE", 4)
 EXP_MODE = _environment_integer("TTTJ_EXP_MODE", 0)
+PV_MODE = _environment_integer("TTTJ_PV_MODE", 1)
+JIT_PV_MODE = tl.constexpr(PV_MODE)
 GELU_MODE = _environment_integer("TTTJ_GELU_MODE", 0)
 CAUSAL_SKIP = bool(_environment_integer("TTTJ_CAUSAL_SKIP", 0))
 NUM_WARPS = _environment_integer("TTTJ_NUM_WARPS", 4)
@@ -574,11 +576,16 @@ def _attention_mxhd(
             lane_sum = item0 + item1
             lane_sum += item2
             lane_sum += item3
-        else:
+        elif K == 64:
             lane_groups = tl.reshape(numerator, (ROW_TILE, 2, 32))
             lane_groups = tl.permute(lane_groups, (0, 2, 1))
             item0, item1 = tl.split(lane_groups)
             lane_sum = item0 + item1
+        else:
+            # S=32 step-4 attention assigns one complete reduction row to a
+            # warp.  Keeping the same shuffle-style tree as PyTorch's
+            # persistent softmax preserves its observable FP16 boundary.
+            lane_sum = numerator
         denominator = _warp_add_halves(lane_sum, ROW_TILE, 32)
         denominator = _warp_add_halves(denominator, ROW_TILE, 16)
         denominator = _warp_add_halves(denominator, ROW_TILE, 8)
@@ -635,7 +642,22 @@ def _attention_mxhd(
         + head * HD
         + value_columns[None, :]
     )
-    context = tl.dot(probabilities, value_tile)
+    if JIT_PV_MODE == 1 and K == 32:
+        # cuBLAS's S32 strided-batched GEMM accumulates two K16 fragments.
+        # Make that boundary explicit rather than letting WGMMA select a
+        # fused K32 schedule whose final FP16 rounding differs by rare ULPs.
+        probability_halves = tl.permute(
+            tl.reshape(probabilities, (ROW_TILE, 2, 16)), (0, 2, 1)
+        )
+        probability0, probability1 = tl.split(probability_halves)
+        value_halves = tl.permute(
+            tl.reshape(value_tile, (2, 16, HD)), (1, 2, 0)
+        )
+        value0, value1 = tl.split(value_halves)
+        context = tl.dot(probability0, value0)
+        context += tl.dot(probability1, value1)
+    else:
+        context = tl.dot(probabilities, value_tile)
     tl.store(
         context_ptr
         + queries[:, None] * D
