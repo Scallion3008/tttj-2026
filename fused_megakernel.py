@@ -88,6 +88,8 @@ GELU_MODE = _environment_integer("TTTJ_GELU_MODE", 0)
 CAUSAL_SKIP = bool(_environment_integer("TTTJ_CAUSAL_SKIP", 0))
 NUM_WARPS = _environment_integer("TTTJ_NUM_WARPS", 4)
 NUM_STAGES = _environment_integer("TTTJ_NUM_STAGES", 3)
+RESIDENT_ASSIST = bool(_environment_integer("TTTJ_RESIDENT_ASSIST", 1))
+RESIDENT_SPLIT_Q = bool(_environment_integer("TTTJ_RESIDENT_SPLIT_Q", 1))
 LINEAR_REDUCTION_TILE = _environment_integer("TTTJ_LINEAR_K", 64)
 ATTENTION_REDUCTION_TILE = _environment_integer("TTTJ_ATTENTION_K", 32)
 LINEAR_ROW_TILE = _environment_integer("TTTJ_LINEAR_M", 64)
@@ -100,6 +102,7 @@ ALL_VALID_TOKENS = bool(_environment_integer("TTTJ_ALL_VALID", 0))
 EXPLICIT_BARRIERS = bool(_environment_integer("TTTJ_BARRIERS", 0))
 JIT_CLUSTERED = tl.constexpr(NUM_CTAS > 1)
 JIT_CLUSTER_THREADS = tl.constexpr(NUM_WARPS * 32)
+ASSIST_SEQUENCES = tl.constexpr(64)
 
 
 def resolved_megakernel_tuning(
@@ -113,6 +116,7 @@ def resolved_megakernel_tuning(
     attention_m = ATTENTION_ROW_TILE
     attention_k = ATTENTION_REDUCTION_TILE
     norm_m = NORM_ROW_TILE
+    num_stages = NUM_STAGES
     if step_3_shape:
         if not _environment_is_set("TTTJ_NUM_WARPS"):
             num_warps = 8
@@ -122,9 +126,11 @@ def resolved_megakernel_tuning(
             attention_m = 128
         if not _environment_is_set("TTTJ_ATTENTION_K"):
             attention_k = 64 if num_heads == 2 else 32
+    if batch_size >= 10000 and not _environment_is_set("TTTJ_NUM_STAGES"):
+        num_stages = 2
     return {
         "num_warps": num_warps,
-        "num_stages": NUM_STAGES,
+        "num_stages": num_stages,
         "linear_m": linear_m,
         "linear_k": LINEAR_REDUCTION_TILE,
         "attention_m": attention_m,
@@ -152,6 +158,27 @@ def _cluster_sync():
         pack=1,
     )
     tl.debug_barrier()
+
+
+@triton.jit
+def _resident_publish(THREADS: tl.constexpr):
+    """Publish cooperative stores to another CTA in the same sequence DAG."""
+    tl.debug_barrier()
+    participants = tl.arange(0, THREADS)
+    _ = tl.inline_asm_elementwise(
+        "membar.gl; mov.u32 $0, $1;",
+        "=r,r,~{memory}",
+        [participants],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    tl.debug_barrier()
+
+
+@triton.jit
+def _resident_acquire(pointer):
+    return tl.atomic_add(pointer, 0, sem="acquire", scope="gpu")
 
 
 @triton.jit
@@ -902,6 +929,8 @@ def _transformer_megakernel(
     workspace_ptr,
     output_ptr,
     trace_ptr,
+    scheduler_ptr,
+    launch_epoch,
     S: tl.constexpr,
     D: tl.constexpr,
     H: tl.constexpr,
@@ -928,8 +957,17 @@ def _transformer_megakernel(
     ALL_VALID: tl.constexpr,
     USE_BARRIERS: tl.constexpr,
     CLUSTERED: tl.constexpr,
+    ASSIST: tl.constexpr,
+    ASSIST_THREADS: tl.constexpr,
+    SPLIT_ASSIST_Q: tl.constexpr,
 ):
-    sequence = tl.program_id(0)
+    worker = tl.program_id(0)
+    if ASSIST:
+        sequence = worker // 2
+        role = worker % 2
+    else:
+        sequence = worker
+        role: tl.constexpr = 0
     input_base = input_ptr + sequence * E
     valid_base = valid_ptr + sequence * S
     workspace_base = workspace_ptr + sequence * WORKSPACE_STRIDE * E
@@ -943,12 +981,49 @@ def _transformer_megakernel(
         probability_scratch = norm
         context = x
     else:
-        q = norm
         k = norm + E
         v = k + E
+        q = v + E if ASSIST else norm
         saved_residual = x
         probability_scratch = v + E
-        context = norm
+        context = q
+    if ASSIST:
+        start_epochs = scheduler_ptr
+        norm_epochs = start_epochs + ASSIST_SEQUENCES
+        k_epochs = norm_epochs + ASSIST_SEQUENCES
+        v_epochs = k_epochs + ASSIST_SEQUENCES
+        qkv_epochs = v_epochs + ASSIST_SEQUENCES
+        attention_epochs = qkv_epochs + ASSIST_SEQUENCES
+        layer_epochs = attention_epochs + ASSIST_SEQUENCES
+        if role == 0:
+            tl.atomic_xchg(
+                norm_epochs + sequence, 0, sem="relaxed", scope="gpu"
+            )
+            tl.atomic_xchg(
+                k_epochs + sequence, 0, sem="relaxed", scope="gpu"
+            )
+            tl.atomic_xchg(
+                v_epochs + sequence, 0, sem="relaxed", scope="gpu"
+            )
+            tl.atomic_xchg(
+                qkv_epochs + sequence, 0, sem="relaxed", scope="gpu"
+            )
+            tl.atomic_xchg(
+                attention_epochs + sequence, 0, sem="relaxed", scope="gpu"
+            )
+            tl.atomic_xchg(
+                layer_epochs + sequence, 0, sem="relaxed", scope="gpu"
+            )
+            tl.atomic_xchg(
+                start_epochs + sequence,
+                launch_epoch,
+                sem="release",
+                scope="gpu",
+            )
+        else:
+            started = _resident_acquire(start_epochs + sequence)
+            while started != launch_epoch:
+                started = _resident_acquire(start_epochs + sequence)
     for layer in range(NUM_LAYERS):
         weights = packed_ptr + layer * LAYER_WEIGHTS
         residual = input_base if layer == 0 else x
@@ -956,83 +1031,191 @@ def _transformer_megakernel(
             attention_residual = saved_residual
         else:
             attention_residual = residual
-        for row_start in range(0, S, NORM_M):
-            _layer_norm_half(
-                residual,
-                norm,
-                saved_residual,
-                weights + JIT_NORM1_WEIGHT,
-                weights + JIT_NORM1_BIAS,
-                row_start,
-                D,
-                NORM_M,
-                NORM_ALGORITHM,
-                CLUSTERED,
+        if role == 0:
+            for row_start in range(0, S, NORM_M):
+                _layer_norm_half(
+                    residual,
+                    norm,
+                    saved_residual,
+                    weights + JIT_NORM1_WEIGHT,
+                    weights + JIT_NORM1_BIAS,
+                    row_start,
+                    D,
+                    NORM_M,
+                    NORM_ALGORITHM,
+                    CLUSTERED,
+                )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(norm, trace_ptr, layer * 9, E, CAPTURE)
+            if ASSIST:
+                _resident_publish(ASSIST_THREADS)
+                tl.atomic_xchg(
+                    norm_epochs + sequence,
+                    layer + 1,
+                    sem="release",
+                    scope="gpu",
+                )
+
+            for row_start in range(0, S, LINEAR_M):
+                for column_start in range(0, D, LINEAR_N):
+                    if not ASSIST:
+                        _linear_tile(
+                            norm,
+                            k,
+                            weights + JIT_K_WEIGHT,
+                            weights + JIT_K_BIAS,
+                            residual,
+                            valid_base,
+                            row_start,
+                            column_start,
+                            D,
+                            0,
+                            GELU_ALGORITHM,
+                            LINEAR_K,
+                            LINEAR_M,
+                            LINEAR_N,
+                            ALL_VALID,
+                        )
+                    _linear_tile(
+                        norm,
+                        v,
+                        weights + JIT_V_WEIGHT,
+                        weights + JIT_V_BIAS,
+                        residual,
+                        valid_base,
+                        row_start,
+                        column_start,
+                        D,
+                        0,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        LINEAR_N,
+                        ALL_VALID,
+                    )
+                    if ASSIST:
+                        if SPLIT_ASSIST_Q:
+                            _resident_publish(ASSIST_THREADS)
+                            tl.atomic_xchg(
+                                v_epochs + sequence,
+                                layer + 1,
+                                sem="release",
+                                scope="gpu",
+                            )
+                        k_ready = _resident_acquire(k_epochs + sequence)
+                        while k_ready < layer + 1:
+                            k_ready = _resident_acquire(k_epochs + sequence)
+                    _linear_tile(
+                        norm,
+                        q,
+                        weights + JIT_Q_WEIGHT,
+                        weights + JIT_Q_BIAS,
+                        residual,
+                        valid_base,
+                        row_start,
+                        column_start,
+                        D,
+                        0,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        64 if SPLIT_ASSIST_Q else LINEAR_N,
+                        ALL_VALID,
+                    )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(q, trace_ptr, layer * 9 + 1, E, CAPTURE)
+            _trace_tensor(k, trace_ptr, layer * 9 + 2, E, CAPTURE)
+            _trace_tensor(v, trace_ptr, layer * 9 + 3, E, CAPTURE)
+            if ASSIST:
+                _resident_publish(ASSIST_THREADS)
+                if SPLIT_ASSIST_Q:
+                    tl.atomic_add(
+                        qkv_epochs + sequence, 1, sem="release", scope="gpu"
+                    )
+                    qkv_ready = _resident_acquire(qkv_epochs + sequence)
+                    while qkv_ready < 2 * (layer + 1):
+                        qkv_ready = _resident_acquire(qkv_epochs + sequence)
+                else:
+                    tl.atomic_xchg(
+                        qkv_epochs + sequence,
+                        layer + 1,
+                        sem="release",
+                        scope="gpu",
+                    )
+        elif ASSIST:
+            norm_ready = _resident_acquire(norm_epochs + sequence)
+            while norm_ready < layer + 1:
+                norm_ready = _resident_acquire(norm_epochs + sequence)
+            for row_start in range(0, S, LINEAR_M):
+                for column_start in range(0, D, LINEAR_N):
+                    _linear_tile(
+                        norm,
+                        k,
+                        weights + JIT_K_WEIGHT,
+                        weights + JIT_K_BIAS,
+                        residual,
+                        valid_base,
+                        row_start,
+                        column_start,
+                        D,
+                        0,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        LINEAR_N,
+                        ALL_VALID,
+                    )
+            _resident_publish(ASSIST_THREADS)
+            tl.atomic_xchg(
+                k_epochs + sequence,
+                layer + 1,
+                sem="release",
+                scope="gpu",
             )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(norm, trace_ptr, layer * 9, E, CAPTURE)
+            if SPLIT_ASSIST_Q:
+                v_ready = _resident_acquire(v_epochs + sequence)
+                while v_ready < layer + 1:
+                    v_ready = _resident_acquire(v_epochs + sequence)
+                for row_start in range(0, S, LINEAR_M):
+                    _linear_tile(
+                        norm,
+                        q,
+                        weights + JIT_Q_WEIGHT,
+                        weights + JIT_Q_BIAS,
+                        residual,
+                        valid_base,
+                        row_start,
+                        64,
+                        D,
+                        0,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        64,
+                        ALL_VALID,
+                    )
+                _resident_publish(ASSIST_THREADS)
+                tl.atomic_add(
+                    qkv_epochs + sequence, 1, sem="release", scope="gpu"
+                )
+                qkv_ready = _resident_acquire(qkv_epochs + sequence)
+                while qkv_ready < 2 * (layer + 1):
+                    qkv_ready = _resident_acquire(qkv_epochs + sequence)
+            else:
+                qkv_ready = _resident_acquire(qkv_epochs + sequence)
+                while qkv_ready < layer + 1:
+                    qkv_ready = _resident_acquire(qkv_epochs + sequence)
 
-        for row_start in range(0, S, LINEAR_M):
-            for column_start in range(0, D, LINEAR_N):
-                _linear_tile(
-                    norm,
-                    k,
-                    weights + JIT_K_WEIGHT,
-                    weights + JIT_K_BIAS,
-                    residual,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    0,
-                    GELU_ALGORITHM,
-                    LINEAR_K,
-                    LINEAR_M,
-                    LINEAR_N,
-                    ALL_VALID,
-                )
-                _linear_tile(
-                    norm,
-                    v,
-                    weights + JIT_V_WEIGHT,
-                    weights + JIT_V_BIAS,
-                    residual,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    0,
-                    GELU_ALGORITHM,
-                    LINEAR_K,
-                    LINEAR_M,
-                    LINEAR_N,
-                    ALL_VALID,
-                )
-                _linear_tile(
-                    norm,
-                    q,
-                    weights + JIT_Q_WEIGHT,
-                    weights + JIT_Q_BIAS,
-                    residual,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    0,
-                    GELU_ALGORITHM,
-                    LINEAR_K,
-                    LINEAR_M,
-                    LINEAR_N,
-                    ALL_VALID,
-                )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(q, trace_ptr, layer * 9 + 1, E, CAPTURE)
-        _trace_tensor(k, trace_ptr, layer * 9 + 2, E, CAPTURE)
-        _trace_tensor(v, trace_ptr, layer * 9 + 3, E, CAPTURE)
-
-        for head in range(H):
+        if ASSIST and H > 1:
+            first_head = role * (H // 2)
+            owned_heads: tl.constexpr = H // 2
+        else:
+            first_head = 0
+            owned_heads: tl.constexpr = H
+        for head_offset in range(owned_heads):
+            head = first_head + head_offset
             if CLUSTERED:
                 _cluster_attention_128x32(
                     q,
@@ -1057,12 +1240,39 @@ def _transformer_megakernel(
                     ALL_VALID,
                 )
             else:
-                if SKIP_CAUSAL_TILES:
+                if ASSIST and H == 1:
+                    if role == 0:
+                        _attention_mxhd(
+                            q,
+                            k,
+                            v,
+                            context,
+                            valid_base,
+                            trace_ptr + (37 + layer * 8) * E,
+                            trace_ptr + (41 + layer * 8) * E,
+                            trace_ptr + (69 + layer * 4) * E,
+                            trace_ptr + (85 + layer) * E,
+                            0,
+                            0,
+                            S,
+                            D,
+                            HD,
+                            S,
+                            SCALE,
+                            CAPTURE,
+                            SOFTMAX_ALGORITHM,
+                            DIVISION_ALGORITHM,
+                            EXP_ALGORITHM,
+                            ATTENTION_K,
+                            ATTENTION_M,
+                            ALL_VALID,
+                        )
+                elif SKIP_CAUSAL_TILES:
                     _attention_mxhd(
                         q,
                         k,
                         v,
-                        norm,
+                        context,
                         valid_base,
                         trace_ptr + (37 + layer * 8) * E,
                         trace_ptr + (41 + layer * 8) * E,
@@ -1087,7 +1297,7 @@ def _transformer_megakernel(
                         q,
                         k,
                         v,
-                        norm,
+                        context,
                         valid_base,
                         trace_ptr + (37 + layer * 8) * E,
                         trace_ptr + (41 + layer * 8) * E,
@@ -1114,7 +1324,7 @@ def _transformer_megakernel(
                             q,
                             k,
                             v,
-                            norm,
+                            context,
                             valid_base,
                             trace_ptr + (37 + layer * 8) * E,
                             trace_ptr + (41 + layer * 8) * E,
@@ -1135,160 +1345,190 @@ def _transformer_megakernel(
                             ATTENTION_M,
                             ALL_VALID,
                         )
-        if USE_BARRIERS and not CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(context, trace_ptr, layer * 9 + 4, E, CAPTURE)
-
-        for row_start in range(0, S, LINEAR_M):
-            for column_start in range(0, D, LINEAR_N):
-                _linear_tile(
-                    context,
-                    k,
-                    weights + JIT_OUT_WEIGHT,
-                    weights + JIT_OUT_BIAS,
-                    attention_residual,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    2,
-                    GELU_ALGORITHM,
-                    LINEAR_K,
-                    LINEAR_M,
-                    LINEAR_N,
-                    ALL_VALID,
+        if ASSIST:
+            _resident_publish(ASSIST_THREADS)
+            if role == 1:
+                tl.atomic_xchg(
+                    attention_epochs + sequence,
+                    layer + 1,
+                    sem="release",
+                    scope="gpu",
                 )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(k, trace_ptr, layer * 9 + 5, E, CAPTURE)
-
-        for row_start in range(0, S, NORM_M):
-            _layer_norm_half(
-                k,
-                norm,
-                norm,
-                weights + JIT_NORM2_WEIGHT,
-                weights + JIT_NORM2_BIAS,
-                row_start,
-                D,
-                NORM_M,
-                NORM_ALGORITHM,
-                False,
-            )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(norm, trace_ptr, layer * 9 + 6, E, CAPTURE)
-
-        for row_start in range(0, S, LINEAR_M):
-            for column_start in range(0, D, LINEAR_N):
-                _linear_tile(
-                    norm,
-                    v,
-                    weights + JIT_FFN_IN_WEIGHT,
-                    weights + JIT_FFN_IN_BIAS,
-                    norm,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    1,
-                    GELU_ALGORITHM,
-                    LINEAR_K,
-                    LINEAR_M,
-                    LINEAR_N,
-                    ALL_VALID,
-                )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(v, trace_ptr, layer * 9 + 7, E, CAPTURE)
-
-        if CLUSTERED:
-            ffn_output = norm if layer == NUM_LAYERS - 1 else x
-        else:
-            ffn_output = x
-        for row_start in range(0, S, LINEAR_M):
-            for column_start in range(0, D, LINEAR_N):
-                _linear_tile(
-                    v,
-                    ffn_output,
-                    weights + JIT_FFN_OUT_WEIGHT,
-                    weights + JIT_FFN_OUT_BIAS,
-                    k,
-                    valid_base,
-                    row_start,
-                    column_start,
-                    D,
-                    3,
-                    GELU_ALGORITHM,
-                    LINEAR_K,
-                    LINEAR_M,
-                    LINEAR_N,
-                    ALL_VALID,
-                )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(ffn_output, trace_ptr, layer * 9 + 8, E, CAPTURE)
-
-    final_norm_weight = packed_ptr + NUM_LAYERS * LAYER_WEIGHTS
-    final_norm_bias = final_norm_weight + D
-    sequence_output = x
-    final_input = norm if CLUSTERED else x
-    if ALL_VALID:
-        for row_start in range(0, S, NORM_M):
-            _layer_norm_half(
-                final_input,
-                sequence_output,
-                sequence_output,
-                final_norm_weight,
-                final_norm_bias,
-                row_start,
-                D,
-                NORM_M,
-                FINAL_NORM_ALGORITHM,
-                False,
-            )
-        if CAPTURE:
-            _stage_barrier(CLUSTERED)
-            _trace_tensor(
-                sequence_output, trace_ptr, NUM_LAYERS * 9, E, CAPTURE
-            )
-    else:
-        final_norm_scratch = k if CLUSTERED else norm
-        for row_start in range(0, S, NORM_M):
-            _layer_norm_half(
-                final_input,
-                final_norm_scratch,
-                final_norm_scratch,
-                final_norm_weight,
-                final_norm_bias,
-                row_start,
-                D,
-                NORM_M,
-                FINAL_NORM_ALGORITHM,
-                False,
-            )
-        if USE_BARRIERS or CLUSTERED:
-            _stage_barrier(CLUSTERED)
-        _trace_tensor(
-            final_norm_scratch,
-            trace_ptr,
-            NUM_LAYERS * 9,
-            E,
-            CAPTURE,
-        )
-        offsets = tl.arange(0, 256)
-        for start in range(0, E, 256):
-            indices = start + offsets
-            result = tl.load(final_norm_scratch + indices)
-            if ALL_VALID:
-                tl.store(sequence_output + indices, result)
+                layer_done = _resident_acquire(layer_epochs + sequence)
+                while layer_done < layer + 1:
+                    layer_done = _resident_acquire(layer_epochs + sequence)
             else:
-                rows = indices // D
-                valid = tl.load(valid_base + rows)
-                tl.store(
-                    sequence_output + indices,
-                    tl.where(valid, result, 0.0),
+                attention_done = _resident_acquire(
+                    attention_epochs + sequence
                 )
+                while attention_done < layer + 1:
+                    attention_done = _resident_acquire(
+                        attention_epochs + sequence
+                    )
+        elif USE_BARRIERS and not CLUSTERED:
+            _stage_barrier(CLUSTERED)
+        if role == 0:
+            _trace_tensor(context, trace_ptr, layer * 9 + 4, E, CAPTURE)
+
+        if role == 0:
+            for row_start in range(0, S, LINEAR_M):
+                for column_start in range(0, D, LINEAR_N):
+                    _linear_tile(
+                        context,
+                        k,
+                        weights + JIT_OUT_WEIGHT,
+                        weights + JIT_OUT_BIAS,
+                        attention_residual,
+                        valid_base,
+                        row_start,
+                        column_start,
+                        D,
+                        2,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        LINEAR_N,
+                        ALL_VALID,
+                    )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(k, trace_ptr, layer * 9 + 5, E, CAPTURE)
+
+            for row_start in range(0, S, NORM_M):
+                _layer_norm_half(
+                    k,
+                    norm,
+                    norm,
+                    weights + JIT_NORM2_WEIGHT,
+                    weights + JIT_NORM2_BIAS,
+                    row_start,
+                    D,
+                    NORM_M,
+                    NORM_ALGORITHM,
+                    False,
+                )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(norm, trace_ptr, layer * 9 + 6, E, CAPTURE)
+
+            for row_start in range(0, S, LINEAR_M):
+                for column_start in range(0, D, LINEAR_N):
+                    _linear_tile(
+                        norm,
+                        v,
+                        weights + JIT_FFN_IN_WEIGHT,
+                        weights + JIT_FFN_IN_BIAS,
+                        norm,
+                        valid_base,
+                        row_start,
+                        column_start,
+                        D,
+                        1,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        LINEAR_N,
+                        ALL_VALID,
+                    )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(v, trace_ptr, layer * 9 + 7, E, CAPTURE)
+
+            if CLUSTERED:
+                ffn_output = norm if layer == NUM_LAYERS - 1 else x
+            else:
+                ffn_output = x
+            for row_start in range(0, S, LINEAR_M):
+                for column_start in range(0, D, LINEAR_N):
+                    _linear_tile(
+                        v,
+                        ffn_output,
+                        weights + JIT_FFN_OUT_WEIGHT,
+                        weights + JIT_FFN_OUT_BIAS,
+                        k,
+                        valid_base,
+                        row_start,
+                        column_start,
+                        D,
+                        3,
+                        GELU_ALGORITHM,
+                        LINEAR_K,
+                        LINEAR_M,
+                        LINEAR_N,
+                        ALL_VALID,
+                    )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(ffn_output, trace_ptr, layer * 9 + 8, E, CAPTURE)
+            if ASSIST:
+                tl.atomic_xchg(
+                    layer_epochs + sequence,
+                    layer + 1,
+                    sem="release",
+                    scope="gpu",
+                )
+
+    if role == 0:
+        final_norm_weight = packed_ptr + NUM_LAYERS * LAYER_WEIGHTS
+        final_norm_bias = final_norm_weight + D
+        sequence_output = x
+        final_input = norm if CLUSTERED else x
+        if ALL_VALID:
+            for row_start in range(0, S, NORM_M):
+                _layer_norm_half(
+                    final_input,
+                    sequence_output,
+                    sequence_output,
+                    final_norm_weight,
+                    final_norm_bias,
+                    row_start,
+                    D,
+                    NORM_M,
+                    FINAL_NORM_ALGORITHM,
+                    False,
+                )
+            if CAPTURE:
+                _stage_barrier(CLUSTERED)
+                _trace_tensor(
+                    sequence_output, trace_ptr, NUM_LAYERS * 9, E, CAPTURE
+                )
+        else:
+            final_norm_scratch = k if CLUSTERED else norm
+            for row_start in range(0, S, NORM_M):
+                _layer_norm_half(
+                    final_input,
+                    final_norm_scratch,
+                    final_norm_scratch,
+                    final_norm_weight,
+                    final_norm_bias,
+                    row_start,
+                    D,
+                    NORM_M,
+                    FINAL_NORM_ALGORITHM,
+                    False,
+                )
+            if USE_BARRIERS or CLUSTERED:
+                _stage_barrier(CLUSTERED)
+            _trace_tensor(
+                final_norm_scratch,
+                trace_ptr,
+                NUM_LAYERS * 9,
+                E,
+                CAPTURE,
+            )
+            offsets = tl.arange(0, 256)
+            for start in range(0, E, 256):
+                indices = start + offsets
+                result = tl.load(final_norm_scratch + indices)
+                if ALL_VALID:
+                    tl.store(sequence_output + indices, result)
+                else:
+                    rows = indices // D
+                    valid = tl.load(valid_base + rows)
+                    tl.store(
+                        sequence_output + indices,
+                        tl.where(valid, result, 0.0),
+                    )
 
 
 def fused_megakernel_forward(
@@ -1299,8 +1539,12 @@ def fused_megakernel_forward(
     num_heads: int = DEFAULT_HEADS,
     capture_trace: bool = False,
     all_valid: bool | None = None,
+    scheduler: torch.Tensor | None = None,
+    launch_epoch: int = 0,
 ):
     batch_size = value.shape[0]
+    use_assist = RESIDENT_ASSIST and batch_size == 64 and num_heads in (2, 4)
+    split_assist_q = use_assist and num_heads == 2 and RESIDENT_SPLIT_Q
     if all_valid is None:
         all_valid = ALL_VALID_TOKENS
     if num_heads not in (1, 2, 4):
@@ -1310,6 +1554,17 @@ def fused_megakernel_forward(
         raise ValueError("trace capture supports one sequence with four heads")
     if NUM_CTAS > 1 and num_heads != DEFAULT_HEADS:
         raise ValueError("the experimental clustered path supports four heads only")
+    if use_assist and (NUM_CTAS > 1 or capture_trace):
+        raise ValueError(
+            "the resident attention-assist path supports only B=64, one-CTA, "
+            "non-tracing launches"
+        )
+    if use_assist and (
+        scheduler is None
+        or scheduler.dtype != torch.int32
+        or scheduler.numel() < 7 * 64
+    ):
+        raise ValueError("resident attention assist requires an int32 scheduler")
     tuning = resolved_megakernel_tuning(batch_size, num_heads)
     if SEQUENCE % tuning["linear_m"] != 0:
         raise ValueError("TTTJ_LINEAR_M must divide 128")
@@ -1322,7 +1577,11 @@ def fused_megakernel_forward(
         or head_dim % tuning["attention_k"] != 0
     ):
         raise ValueError("TTTJ_ATTENTION_K must divide and not exceed head_dim")
-    workspace_slots = CLUSTER_WORKSPACE_SLOTS if NUM_CTAS > 1 else WORKSPACE_SLOTS
+    workspace_slots = (
+        CLUSTER_WORKSPACE_SLOTS
+        if NUM_CTAS > 1 or use_assist
+        else WORKSPACE_SLOTS
+    )
     workspace = torch.empty(
         (batch_size, workspace_slots, SEQUENCE, MODEL),
         device=value.device,
@@ -1338,13 +1597,17 @@ def fused_megakernel_forward(
         if capture_trace
         else workspace
     )
-    _transformer_megakernel[(batch_size,)](
+    scheduler_argument = scheduler if scheduler is not None else packed_weights
+    grid = batch_size * 2 if use_assist else batch_size
+    _transformer_megakernel[(grid,)](
         value,
         valid_mask,
         packed_weights,
         workspace,
         output,
         trace,
+        scheduler_argument,
+        launch_epoch,
         S=SEQUENCE,
         D=MODEL,
         H=num_heads,
@@ -1371,6 +1634,9 @@ def fused_megakernel_forward(
         ALL_VALID=all_valid,
         USE_BARRIERS=EXPLICIT_BARRIERS or capture_trace,
         CLUSTERED=NUM_CTAS > 1,
+        ASSIST=use_assist,
+        ASSIST_THREADS=tuning["num_warps"] * 32,
+        SPLIT_ASSIST_Q=split_assist_q,
         num_warps=tuning["num_warps"],
         num_ctas=NUM_CTAS,
         num_stages=tuning["num_stages"],

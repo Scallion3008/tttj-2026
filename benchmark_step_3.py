@@ -30,6 +30,8 @@ DTYPE_BYTES = 2
 H200_NVL_DENSE_FP16_TFLOPS = 835.5
 H200_SXM_DENSE_FP16_TFLOPS = 989.5
 H200_HBM_TBPS = 4.8
+H100_NVL_DENSE_FP16_TFLOPS = 835.5
+H100_NVL_HBM_TBPS = 3.9
 
 CASE_FOR_HEADS = {4: 1, 1: 9, 2: 10}
 
@@ -322,6 +324,7 @@ def run_accuracy(
     heads: list[int],
     trials: int,
     padding_ratios: list[float],
+    scales: list[float],
 ) -> bool:
     print("\n=== Strict numerical gate ===")
     passed = True
@@ -329,44 +332,64 @@ def run_accuracy(
         for num_heads in heads:
             baseline, sdpa, optimized, config, _, _ = models_for_heads(num_heads)
             for padding_ratio in padding_ratios:
-                failed = {"megakernel": 0, "sdpa": 0}
-                max_abs = {"megakernel": 0.0, "sdpa": 0.0}
-                for trial in range(trials):
-                    value, valid_mask = generate_random_case(
-                        config=config,
-                        device=torch.device("cuda"),
-                        dtype=torch.float16,
-                        seed=SEED + trial + round(100 * padding_ratio),
-                        padding_ratio=padding_ratio,
-                        input_scale=1.0,
-                    )
-                    reference = baseline(value, valid_mask)
-                    candidates = {
-                        "megakernel": optimized(value, valid_mask),
-                        "sdpa": sdpa(value, valid_mask),
-                    }
-                    for provider, candidate in candidates.items():
-                        result = compare_outputs(
-                            reference,
-                            candidate,
-                            rtol=0.01,
-                            atol=0.001,
+                for scale in scales:
+                    failed = {"megakernel": 0, "sdpa": 0}
+                    max_abs = {"megakernel": 0.0, "sdpa": 0.0}
+                    repeat_failed = 0
+                    for trial in range(trials):
+                        value, valid_mask = generate_random_case(
+                            config=config,
+                            device=torch.device("cuda"),
+                            dtype=torch.float16,
+                            seed=(
+                                SEED
+                                + trial
+                                + round(100 * padding_ratio)
+                                + round(scale * 1000)
+                            ),
+                            padding_ratio=padding_ratio,
+                            input_scale=scale,
                         )
-                        failed[provider] += result.failed_elements
-                        max_abs[provider] = max(
-                            max_abs[provider], result.max_abs_error
+                        reference = baseline(value, valid_mask)
+                        candidates = {
+                            "megakernel": optimized(value, valid_mask),
+                            "sdpa": sdpa(value, valid_mask),
+                        }
+                        repeated = optimized(value, valid_mask)
+                        repeat_failed += int(
+                            (candidates["megakernel"] != repeated).sum().item()
                         )
-                        if provider == "megakernel":
-                            passed &= result.passed
-                for provider in ("megakernel", "sdpa"):
-                    status = "PASS" if failed[provider] == 0 else "FAIL"
-                    print(
-                        f"case {CASE_FOR_HEADS[num_heads]:2d} H={num_heads} "
-                        f"padding={padding_ratio:.2f} {provider}: {status} "
-                        f"failed={failed[provider]}/"
-                        f"{trials * BATCH * SEQUENCE * MODEL} "
-                        f"max_abs={max_abs[provider]:.7g}"
-                    )
+                        for provider, candidate in candidates.items():
+                            result = compare_outputs(
+                                reference,
+                                candidate,
+                                rtol=0.01,
+                                atol=0.001,
+                            )
+                            failed[provider] += result.failed_elements
+                            max_abs[provider] = max(
+                                max_abs[provider], result.max_abs_error
+                            )
+                            if provider == "megakernel":
+                                passed &= result.passed
+                    passed &= repeat_failed == 0
+                    for provider in ("megakernel", "sdpa"):
+                        provider_passed = failed[provider] == 0 and (
+                            provider != "megakernel" or repeat_failed == 0
+                        )
+                        status = "PASS" if provider_passed else "FAIL"
+                        print(
+                            f"case {CASE_FOR_HEADS[num_heads]:2d} H={num_heads} "
+                            f"padding={padding_ratio:.2f} scale={scale:g} "
+                            f"{provider}: {status} failed={failed[provider]}/"
+                            f"{trials * BATCH * SEQUENCE * MODEL} "
+                            f"max_abs={max_abs[provider]:.7g}"
+                            + (
+                                f" repeat_diff={repeat_failed}"
+                                if provider == "megakernel"
+                                else ""
+                            )
+                        )
     return passed
 
 
@@ -379,10 +402,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--padding-ratios", nargs="+", type=float, default=(0.0,)
     )
+    parser.add_argument("--scales", nargs="+", type=float, default=(1.0,))
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--peak-tflops", type=float)
-    parser.add_argument("--peak-memory-tbps", type=float, default=H200_HBM_TBPS)
+    parser.add_argument("--peak-memory-tbps", type=float)
     return parser.parse_args()
 
 
@@ -394,17 +418,22 @@ def main() -> int:
     properties = torch.cuda.get_device_properties(0)
     if properties.major != 9 or properties.minor != 0:
         raise RuntimeError(f"Hopper sm_90 is required, got {properties.name}")
-    if "H200" not in properties.name:
-        raise RuntimeError(f"an H200 is required, got {properties.name}")
+    if "H100" not in properties.name and "H200" not in properties.name:
+        raise RuntimeError(f"an H100 or H200 is required, got {properties.name}")
 
-    default_peak = (
-        H200_NVL_DENSE_FP16_TFLOPS
-        if "NVL" in properties.name
-        else H200_SXM_DENSE_FP16_TFLOPS
-    )
+    if "H100" in properties.name and "NVL" in properties.name:
+        default_peak = H100_NVL_DENSE_FP16_TFLOPS
+        default_memory = H100_NVL_HBM_TBPS
+    else:
+        default_peak = (
+            H200_NVL_DENSE_FP16_TFLOPS
+            if "NVL" in properties.name
+            else H200_SXM_DENSE_FP16_TFLOPS
+        )
+        default_memory = H200_HBM_TBPS
     ROOFLINE = Roofline(
         peak_compute_tflops=args.peak_tflops or default_peak,
-        peak_memory_tbps=args.peak_memory_tbps,
+        peak_memory_tbps=args.peak_memory_tbps or default_memory,
     )
     WARMUP = 25 if args.quick else 100
     REPETITIONS = 75 if args.quick else 500
@@ -437,6 +466,7 @@ def main() -> int:
         selected_heads,
         args.accuracy_trials,
         args.padding_ratios,
+        args.scales,
     )
     if not passed:
         print("roofline benchmark skipped because the strict gate failed")

@@ -73,12 +73,22 @@ DAG_LINEAR_M = _environment_integer("TTTJ_DAG_LINEAR_M", LINEAR_M)
 DAG_LINEAR_N = _environment_integer("TTTJ_DAG_LINEAR_N", LINEAR_N)
 DAG_LINEAR_K = _environment_integer("TTTJ_DAG_LINEAR_K", LINEAR_K)
 DAG_NORM_M = _environment_integer("TTTJ_DAG_NORM_M", NORM_M)
-DAG_MAX_PROGRAMS = _environment_integer("TTTJ_DAG_PROGRAMS", 132)
 JIT_DAG_THREADS = tl.constexpr(DAG_NUM_WARPS * 32)
 DAG_PARALLEL_TAIL = bool(_environment_integer("TTTJ_DAG_PARALLEL_TAIL", 1))
 DAG_PARALLEL_S32_ATTENTION = bool(
     _environment_integer("TTTJ_DAG_PARALLEL_S32_ATTENTION", 1)
 )
+DAG_PARALLEL_S32_TAIL = bool(
+    _environment_integer("TTTJ_DAG_PARALLEL_S32_TAIL", 1)
+)
+DAG_S32_FOUR_ROLES = bool(_environment_integer("TTTJ_DAG_S32_FOUR_ROLES", 1))
+DAG_S128_FOUR_ROLES = bool(
+    _environment_integer("TTTJ_DAG_S128_FOUR_ROLES", 1)
+)
+DAG_PARALLEL_S128_NORM = bool(
+    _environment_integer("TTTJ_DAG_PARALLEL_S128_NORM", 1)
+)
+DAG_SPLIT_S128_Q = bool(_environment_integer("TTTJ_DAG_SPLIT_S128_Q", 1))
 
 # Scheduler layout.  Every task occupies exactly one monotonically allocated
 # queue slot; case 12 is the largest graph at 2,848 tasks.
@@ -147,7 +157,13 @@ def resolved_dag_tuning(batch_size: int, sequence: int) -> dict[str, int]:
     # S128 uses M128; S32 pairs two sequences into one M64 row.
     attention_tasks = row_tiles
     linear_tasks = row_tiles * triton.cdiv(MODEL, DAG_LINEAR_N)
-    programs = min(DAG_MAX_PROGRAMS, max(qkv_tasks, attention_tasks, linear_tasks))
+    # Every static role is a distinct CTA.  Four-role specializations add a
+    # helper without truncating any Q/K/V producer.
+    programs = max(qkv_tasks, attention_tasks, linear_tasks)
+    if sequence == 32 and DAG_S32_FOUR_ROLES:
+        programs = 4 * (batch_size // 2)
+    if sequence == 128 and linear_m == 128 and DAG_S128_FOUR_ROLES:
+        programs = 4 * batch_size
     return {
         "programs": programs,
         "num_warps": num_warps,
@@ -202,6 +218,11 @@ def _publish_cta_writes():
         pack=1,
     )
     tl.debug_barrier()
+
+
+@triton.jit
+def _scheduler_acquire_load(pointer):
+    return tl.atomic_add(pointer, 0, sem="acquire", scope="gpu")
 
 
 @triton.jit
@@ -1072,7 +1093,7 @@ def _completion_dag_megakernel(
 
 
 @triton.jit
-def _parallel_s128_tail_half(
+def _parallel_tail(
     norm,
     q,
     v,
@@ -1090,6 +1111,7 @@ def _parallel_s128_tail_half(
     FINAL_LAYER: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
     LAYER_WEIGHTS: tl.constexpr,
+    ROW_TILE: tl.constexpr,
 ):
     _linear_tile(
         norm,
@@ -1104,7 +1126,7 @@ def _parallel_s128_tail_half(
         2,
         GELU_ALGORITHM,
         LINEAR_REDUCTION_TILE,
-        64,
+        ROW_TILE,
         128,
         ALL_VALID,
     )
@@ -1117,7 +1139,7 @@ def _parallel_s128_tail_half(
         weights + JIT_NORM2_BIAS,
         row_start,
         D,
-        64,
+        ROW_TILE,
         NORM_ALGORITHM,
         False,
     )
@@ -1135,7 +1157,7 @@ def _parallel_s128_tail_half(
         1,
         GELU_ALGORITHM,
         LINEAR_REDUCTION_TILE,
-        64,
+        ROW_TILE,
         128,
         ALL_VALID,
     )
@@ -1153,7 +1175,7 @@ def _parallel_s128_tail_half(
         3,
         GELU_ALGORITHM,
         LINEAR_REDUCTION_TILE,
-        64,
+        ROW_TILE,
         128,
         ALL_VALID,
     )
@@ -1169,12 +1191,12 @@ def _parallel_s128_tail_half(
             final_norm_bias,
             row_start,
             D,
-            64,
+            ROW_TILE,
             NORM_ALGORITHM,
             False,
         )
         if not ALL_VALID:
-            rows = row_start + tl.arange(0, 64)
+            rows = row_start + tl.arange(0, ROW_TILE)
             columns = tl.arange(0, D)
             values = tl.load(
                 output_ptr + rows[:, None] * D + columns[None, :]
@@ -1220,24 +1242,40 @@ def _static_sequence_dag_megakernel(
     ALL_VALID: tl.constexpr,
     PARALLEL_TAIL: tl.constexpr,
     PARALLEL_S32_ATTENTION: tl.constexpr,
+    PARALLEL_S32_TAIL: tl.constexpr,
+    S32_FOUR_ROLES: tl.constexpr,
+    S128_FOUR_ROLES: tl.constexpr,
+    PARALLEL_S128_NORM: tl.constexpr,
+    SPLIT_S128_Q: tl.constexpr,
 ):
     worker = tl.program_id(0)
     if S == 128:
         groups: tl.constexpr = B
         rows_per_group: tl.constexpr = S // LINEAR_ROW_TILE
-        roles: tl.constexpr = 3 * rows_per_group
+        roles: tl.constexpr = (
+            4 if S128_FOUR_ROLES and LINEAR_ROW_TILE == 128
+            else 3 * rows_per_group
+        )
+        projection_roles: tl.constexpr = (
+            4
+            if S128_FOUR_ROLES and SPLIT_S128_Q and LINEAR_ROW_TILE == 128
+            else 3 * rows_per_group
+        )
         group = worker // roles
         role = worker % roles
-        branch = role // rows_per_group
+        branch = tl.minimum(role // rows_per_group, 2)
         local_row = role % rows_per_group
     else:
         groups: tl.constexpr = B // 2
-        roles: tl.constexpr = 3
+        roles: tl.constexpr = 4 if S32_FOUR_ROLES else 3
+        projection_roles: tl.constexpr = 3
         rows_per_group: tl.constexpr = 1
         group = worker // roles
         role = worker % roles
-        branch = role
+        branch = tl.minimum(role, 2)
         local_row = 0
+    s32_attention_roles: tl.constexpr = 4 if S32_FOUR_ROLES else 2
+    s128_attention_roles: tl.constexpr = 4 if S128_FOUR_ROLES else 2
 
     qkv_counts = scheduler_ptr
     layer_epochs = qkv_counts + groups
@@ -1276,13 +1314,9 @@ def _static_sequence_dag_megakernel(
             scope="gpu",
         )
     else:
-        started = tl.atomic_add(
-            start_epochs + group, 0, sem="acquire", scope="gpu"
-        )
+        started = _scheduler_acquire_load(start_epochs + group)
         while started != launch_epoch:
-            started = tl.atomic_add(
-                start_epochs + group, 0, sem="acquire", scope="gpu"
-            )
+            started = _scheduler_acquire_load(start_epochs + group)
     row_tile = group * rows_per_group + local_row
     row_start = row_tile * LINEAR_ROW_TILE
     norm = workspace_ptr
@@ -1297,8 +1331,18 @@ def _static_sequence_dag_megakernel(
 
         # Q owns LayerNorm production for its row.  K/V roles wait only for
         # that row, so separate sequence groups naturally drift across phases.
-        if branch == 0:
-            for norm_offset in range(0, LINEAR_ROW_TILE, NORM_ROW_TILE):
+        parallel_s128_norm: tl.constexpr = (
+            S == 128
+            and LINEAR_ROW_TILE == 128
+            and S128_FOUR_ROLES
+            and PARALLEL_S128_NORM
+        )
+        if parallel_s128_norm:
+            # The fourth role has no projection work.  Use it to produce the
+            # second M64 half of LayerNorm1 while the Q role produces the
+            # first.  The cumulative counter avoids another per-layer reset.
+            if role == 0 or role == 3:
+                norm_offset = 0 if role == 0 else NORM_ROW_TILE
                 _layer_norm_half(
                     residual,
                     norm,
@@ -1311,76 +1355,164 @@ def _static_sequence_dag_megakernel(
                     NORM_ALGORITHM,
                     False,
                 )
-            _publish_cta_writes()
-            tl.atomic_xchg(
-                norm_ready + group * rows_per_group + local_row,
-                layer + 1,
-                sem="release",
-                scope="gpu",
-            )
-        else:
-            ready = tl.atomic_add(
-                norm_ready + group * rows_per_group + local_row,
-                0,
-                sem="acquire",
-                scope="gpu",
-            )
-            while ready < layer + 1:
-                ready = tl.atomic_add(
-                    norm_ready + group * rows_per_group + local_row,
-                    0,
-                    sem="acquire",
+                _publish_cta_writes()
+                tl.atomic_add(
+                    norm_ready + group,
+                    1,
+                    sem="release",
                     scope="gpu",
                 )
+            ready = _scheduler_acquire_load(norm_ready + group)
+            while ready < 2 * (layer + 1):
+                ready = _scheduler_acquire_load(norm_ready + group)
 
-        _linear_tile(
-            norm,
-            q + branch * E,
-            weights + JIT_Q_WEIGHT + branch * branch_stride,
-            weights + JIT_Q_BIAS + branch * branch_stride,
-            residual,
-            valid_ptr,
-            row_start,
-            0,
-            D,
-            0,
-            GELU_ALGORITHM,
-            LINEAR_REDUCTION_TILE,
-            LINEAR_ROW_TILE,
-            LINEAR_COLUMN_TILE,
-            ALL_VALID,
-        )
-        _publish_cta_writes()
-        tl.atomic_add(
-            qkv_counts + group, 1, sem="release", scope="gpu"
-        )
+        if role < projection_roles:
+            if branch == 0 and not parallel_s128_norm:
+                for norm_offset in range(0, LINEAR_ROW_TILE, NORM_ROW_TILE):
+                    _layer_norm_half(
+                        residual,
+                        norm,
+                        norm,
+                        weights + JIT_NORM1_WEIGHT,
+                        weights + JIT_NORM1_BIAS,
+                        row_start + norm_offset,
+                        D,
+                        NORM_ROW_TILE,
+                        NORM_ALGORITHM,
+                        False,
+                    )
+                _publish_cta_writes()
+                tl.atomic_xchg(
+                    norm_ready + group * rows_per_group + local_row,
+                    layer + 1,
+                    sem="release",
+                    scope="gpu",
+                )
+            elif not parallel_s128_norm:
+                ready = _scheduler_acquire_load(
+                    norm_ready + group * rows_per_group + local_row
+                )
+                while ready < layer + 1:
+                    ready = _scheduler_acquire_load(
+                        norm_ready + group * rows_per_group + local_row
+                    )
+
+            if SPLIT_S128_Q and S == 128 and LINEAR_ROW_TILE == 128:
+                if role == 0 or role == 3:
+                    q_column = 0 if role == 0 else 64
+                    _linear_tile(
+                        norm,
+                        q,
+                        weights + JIT_Q_WEIGHT,
+                        weights + JIT_Q_BIAS,
+                        residual,
+                        valid_ptr,
+                        row_start,
+                        q_column,
+                        D,
+                        0,
+                        GELU_ALGORITHM,
+                        LINEAR_REDUCTION_TILE,
+                        LINEAR_ROW_TILE,
+                        64,
+                        ALL_VALID,
+                    )
+                else:
+                    _linear_tile(
+                        norm,
+                        q + branch * E,
+                        weights + JIT_Q_WEIGHT + branch * branch_stride,
+                        weights + JIT_Q_BIAS + branch * branch_stride,
+                        residual,
+                        valid_ptr,
+                        row_start,
+                        0,
+                        D,
+                        0,
+                        GELU_ALGORITHM,
+                        LINEAR_REDUCTION_TILE,
+                        LINEAR_ROW_TILE,
+                        LINEAR_COLUMN_TILE,
+                        ALL_VALID,
+                    )
+            else:
+                _linear_tile(
+                    norm,
+                    q + branch * E,
+                    weights + JIT_Q_WEIGHT + branch * branch_stride,
+                    weights + JIT_Q_BIAS + branch * branch_stride,
+                    residual,
+                    valid_ptr,
+                    row_start,
+                    0,
+                    D,
+                    0,
+                    GELU_ALGORITHM,
+                    LINEAR_REDUCTION_TILE,
+                    LINEAR_ROW_TILE,
+                    LINEAR_COLUMN_TILE,
+                    ALL_VALID,
+                )
+            _publish_cta_writes()
+            tl.atomic_add(
+                qkv_counts + group, 1, sem="release", scope="gpu"
+            )
+        else:
+            complete = _scheduler_acquire_load(qkv_counts + group)
+            while complete < projection_roles:
+                complete = _scheduler_acquire_load(qkv_counts + group)
+            _publish_cta_writes()
 
         if role == 0:
-            complete = tl.atomic_add(
-                qkv_counts + group, 0, sem="acquire", scope="gpu"
-            )
-            while complete < roles:
-                complete = tl.atomic_add(
-                    qkv_counts + group, 0, sem="acquire", scope="gpu"
-                )
+            complete = _scheduler_acquire_load(qkv_counts + group)
+            while complete < projection_roles:
+                complete = _scheduler_acquire_load(qkv_counts + group)
             _publish_cta_writes()
 
             # Attention and the residual/FFN tail own complete M64 rows.
             # Other sequence groups continue their QKV or prior/later layers
             # while this CTA advances its group.
             if S == 128 and LINEAR_ROW_TILE == 128:
-                attention_complete = tl.atomic_add(
-                    attention_counts + group,
-                    0,
-                    sem="acquire",
-                    scope="gpu",
-                )
-                while attention_complete < 2:
-                    attention_complete = tl.atomic_add(
-                        attention_counts + group,
+                if S128_FOUR_ROLES:
+                    sequence_offset = group * S * D
+                    _attention_mxhd(
+                        q + sequence_offset,
+                        k + sequence_offset,
+                        v + sequence_offset,
+                        norm + sequence_offset,
+                        valid_ptr + group * S,
+                        workspace_ptr,
+                        workspace_ptr,
+                        workspace_ptr,
+                        workspace_ptr,
                         0,
-                        sem="acquire",
+                        0,
+                        S,
+                        D,
+                        HD,
+                        S,
+                        SCALE,
+                        False,
+                        SOFTMAX_ALGORITHM,
+                        DIVISION_ALGORITHM,
+                        EXP_ALGORITHM,
+                        ATTENTION_REDUCTION_TILE,
+                        ATTENTION_ROW_TILE,
+                        ALL_VALID,
+                    )
+                    _publish_cta_writes()
+                    tl.atomic_add(
+                        attention_counts + group,
+                        1,
+                        sem="release",
                         scope="gpu",
+                    )
+                attention_complete = _scheduler_acquire_load(
+                    attention_counts + group
+                )
+                while attention_complete < s128_attention_roles:
+                    attention_complete = _scheduler_acquire_load(
+                        attention_counts + group
                     )
                 _publish_cta_writes()
             elif S == 128:
@@ -1462,7 +1594,10 @@ def _static_sequence_dag_megakernel(
                 for sequence_in_row in range(0, sequences_in_row):
                     sequence = first_sequence + sequence_in_row
                     sequence_offset = sequence * S * D
-                    for head in range(0, H):
+                    role0_heads: tl.constexpr = (
+                        2 if S == 32 and S32_FOUR_ROLES else H
+                    )
+                    for head in range(0, role0_heads):
                         if S == 128 and query_tile == 0:
                             _attention_mxhd(
                                 q + sequence_offset,
@@ -1523,92 +1658,115 @@ def _static_sequence_dag_megakernel(
                         sem="release",
                         scope="gpu",
                     )
-                    attention_complete = tl.atomic_add(
-                        attention_counts + group,
-                        0,
-                        sem="acquire",
-                        scope="gpu",
+                    attention_complete = _scheduler_acquire_load(
+                        attention_counts + group
                     )
-                    while attention_complete < 2:
-                        attention_complete = tl.atomic_add(
-                            attention_counts + group,
-                            0,
-                            sem="acquire",
-                            scope="gpu",
+                    while attention_complete < s32_attention_roles:
+                        attention_complete = _scheduler_acquire_load(
+                            attention_counts + group
                         )
                     _publish_cta_writes()
                 else:
                     tl.debug_barrier()
-                _linear_tile(
-                    norm,
-                    q,
-                    weights + JIT_OUT_WEIGHT,
-                    weights + JIT_OUT_BIAS,
-                    residual,
-                    valid_ptr,
-                    owned_row_start,
-                    0,
-                    D,
-                    2,
-                    GELU_ALGORITHM,
-                    LINEAR_REDUCTION_TILE,
-                    LINEAR_ROW_TILE,
-                    LINEAR_COLUMN_TILE,
-                    ALL_VALID,
-                )
-                tl.debug_barrier()
-                for norm_offset in range(0, LINEAR_ROW_TILE, NORM_ROW_TILE):
-                    _layer_norm_half(
+                if S == 32 and PARALLEL_S32_TAIL:
+                    _parallel_tail(
+                        norm,
                         q,
-                        norm,
-                        norm,
-                        weights + JIT_NORM2_WEIGHT,
-                        weights + JIT_NORM2_BIAS,
-                        owned_row_start + norm_offset,
+                        v,
+                        output_ptr,
+                        weights,
+                        residual,
+                        valid_ptr,
+                        packed_ptr,
+                        owned_row_start,
                         D,
-                        NORM_ROW_TILE,
+                        LINEAR_REDUCTION_TILE,
                         NORM_ALGORITHM,
-                        False,
+                        GELU_ALGORITHM,
+                        ALL_VALID,
+                        layer == NUM_LAYERS - 1,
+                        NUM_LAYERS,
+                        LAYER_WEIGHTS,
+                        32,
                     )
-                tl.debug_barrier()
-                _linear_tile(
-                    norm,
-                    v,
-                    weights + JIT_FFN_IN_WEIGHT,
-                    weights + JIT_FFN_IN_BIAS,
-                    norm,
-                    valid_ptr,
-                    owned_row_start,
-                    0,
-                    D,
-                    1,
-                    GELU_ALGORITHM,
-                    LINEAR_REDUCTION_TILE,
-                    LINEAR_ROW_TILE,
-                    LINEAR_COLUMN_TILE,
-                    ALL_VALID,
-                )
-                tl.debug_barrier()
-                _linear_tile(
-                    v,
-                    output_ptr,
-                    weights + JIT_FFN_OUT_WEIGHT,
-                    weights + JIT_FFN_OUT_BIAS,
-                    q,
-                    valid_ptr,
-                    owned_row_start,
-                    0,
-                    D,
-                    3,
-                    GELU_ALGORITHM,
-                    LINEAR_REDUCTION_TILE,
-                    LINEAR_ROW_TILE,
-                    LINEAR_COLUMN_TILE,
-                    ALL_VALID,
-                )
-                _publish_cta_writes()
+                    tl.atomic_add(
+                        tail_counts + group, 1, sem="release", scope="gpu"
+                    )
+                else:
+                    _linear_tile(
+                        norm,
+                        q,
+                        weights + JIT_OUT_WEIGHT,
+                        weights + JIT_OUT_BIAS,
+                        residual,
+                        valid_ptr,
+                        owned_row_start,
+                        0,
+                        D,
+                        2,
+                        GELU_ALGORITHM,
+                        LINEAR_REDUCTION_TILE,
+                        LINEAR_ROW_TILE,
+                        LINEAR_COLUMN_TILE,
+                        ALL_VALID,
+                    )
+                    tl.debug_barrier()
+                    for norm_offset in range(0, LINEAR_ROW_TILE, NORM_ROW_TILE):
+                        _layer_norm_half(
+                            q,
+                            norm,
+                            norm,
+                            weights + JIT_NORM2_WEIGHT,
+                            weights + JIT_NORM2_BIAS,
+                            owned_row_start + norm_offset,
+                            D,
+                            NORM_ROW_TILE,
+                            NORM_ALGORITHM,
+                            False,
+                        )
+                    tl.debug_barrier()
+                    _linear_tile(
+                        norm,
+                        v,
+                        weights + JIT_FFN_IN_WEIGHT,
+                        weights + JIT_FFN_IN_BIAS,
+                        norm,
+                        valid_ptr,
+                        owned_row_start,
+                        0,
+                        D,
+                        1,
+                        GELU_ALGORITHM,
+                        LINEAR_REDUCTION_TILE,
+                        LINEAR_ROW_TILE,
+                        LINEAR_COLUMN_TILE,
+                        ALL_VALID,
+                    )
+                    tl.debug_barrier()
+                    _linear_tile(
+                        v,
+                        output_ptr,
+                        weights + JIT_FFN_OUT_WEIGHT,
+                        weights + JIT_FFN_OUT_BIAS,
+                        q,
+                        valid_ptr,
+                        owned_row_start,
+                        0,
+                        D,
+                        3,
+                        GELU_ALGORITHM,
+                        LINEAR_REDUCTION_TILE,
+                        LINEAR_ROW_TILE,
+                        LINEAR_COLUMN_TILE,
+                        ALL_VALID,
+                    )
+                    _publish_cta_writes()
 
-            if layer == NUM_LAYERS - 1 and not PARALLEL_TAIL:
+            if (
+                layer == NUM_LAYERS - 1
+                and not PARALLEL_TAIL
+                and not (S == 32 and PARALLEL_S32_TAIL)
+            ):
                 final_norm_weight = packed_ptr + NUM_LAYERS * LAYER_WEIGHTS
                 final_norm_bias = final_norm_weight + D
                 for group_row in range(0, rows_per_group):
@@ -1654,17 +1812,13 @@ def _static_sequence_dag_megakernel(
                             )
                 _publish_cta_writes()
 
-            if S == 128 and LINEAR_ROW_TILE == 128 and PARALLEL_TAIL:
-                tails_complete = tl.atomic_add(
-                    tail_counts + group, 0, sem="acquire", scope="gpu"
-                )
+            if (
+                (S == 128 and LINEAR_ROW_TILE == 128 and PARALLEL_TAIL)
+                or (S == 32 and PARALLEL_S32_TAIL)
+            ):
+                tails_complete = _scheduler_acquire_load(tail_counts + group)
                 while tails_complete < 2:
-                    tails_complete = tl.atomic_add(
-                        tail_counts + group,
-                        0,
-                        sem="acquire",
-                        scope="gpu",
-                    )
+                    tails_complete = _scheduler_acquire_load(tail_counts + group)
                 _publish_cta_writes()
 
             tl.atomic_xchg(
@@ -1680,7 +1834,10 @@ def _static_sequence_dag_megakernel(
                     sem="relaxed",
                     scope="gpu",
                 )
-            if S == 128 and LINEAR_ROW_TILE == 128 and PARALLEL_TAIL:
+            if (
+                (S == 128 and LINEAR_ROW_TILE == 128 and PARALLEL_TAIL)
+                or (S == 32 and PARALLEL_S32_TAIL)
+            ):
                 tl.atomic_xchg(
                     tail_counts + group,
                     0,
@@ -1695,43 +1852,51 @@ def _static_sequence_dag_megakernel(
             )
         else:
             if S == 128 and LINEAR_ROW_TILE == 128:
-                complete = tl.atomic_add(
-                    qkv_counts + group, 0, sem="acquire", scope="gpu"
-                )
-                while complete < roles:
-                    complete = tl.atomic_add(
-                        qkv_counts + group, 0, sem="acquire", scope="gpu"
-                    )
+                complete = _scheduler_acquire_load(qkv_counts + group)
+                while complete < projection_roles:
+                    complete = _scheduler_acquire_load(qkv_counts + group)
                 _publish_cta_writes()
                 sequence_offset = group * S * D
-                first_head = (role - 1) * 2
-                for head_offset in range(0, 2):
+                if S128_FOUR_ROLES:
+                    first_head: tl.constexpr = role
+                    role_heads: tl.constexpr = 1
+                elif H == 4:
+                    first_head: tl.constexpr = (role - 1) * 2
+                    role_heads: tl.constexpr = 2
+                elif H == 2:
+                    first_head: tl.constexpr = role - 1
+                    role_heads: tl.constexpr = 1
+                else:
+                    first_head: tl.constexpr = 0
+                    role_heads: tl.constexpr = 1
+                for head_offset in range(0, role_heads):
                     head = first_head + head_offset
-                    _attention_mxhd(
-                        q + sequence_offset,
-                        k + sequence_offset,
-                        v + sequence_offset,
-                        norm + sequence_offset,
-                        valid_ptr + group * S,
-                        workspace_ptr,
-                        workspace_ptr,
-                        workspace_ptr,
-                        workspace_ptr,
-                        0,
-                        head,
-                        S,
-                        D,
-                        HD,
-                        S,
-                        SCALE,
-                        False,
-                        SOFTMAX_ALGORITHM,
-                        DIVISION_ALGORITHM,
-                        EXP_ALGORITHM,
-                        ATTENTION_REDUCTION_TILE,
-                        ATTENTION_ROW_TILE,
-                        ALL_VALID,
-                    )
+                    if H != 1 or role == 1:
+                        _attention_mxhd(
+                            q + sequence_offset,
+                            k + sequence_offset,
+                            v + sequence_offset,
+                            norm + sequence_offset,
+                            valid_ptr + group * S,
+                            workspace_ptr,
+                            workspace_ptr,
+                            workspace_ptr,
+                            workspace_ptr,
+                            0,
+                            head,
+                            S,
+                            D,
+                            HD,
+                            S,
+                            SCALE,
+                            False,
+                            SOFTMAX_ALGORITHM,
+                            DIVISION_ALGORITHM,
+                            EXP_ALGORITHM,
+                            ATTENTION_REDUCTION_TILE,
+                            ATTENTION_ROW_TILE,
+                            ALL_VALID,
+                        )
                 _publish_cta_writes()
                 tl.atomic_add(
                     attention_counts + group,
@@ -1739,23 +1904,17 @@ def _static_sequence_dag_megakernel(
                     sem="release",
                     scope="gpu",
                 )
-                if PARALLEL_TAIL:
-                    attention_complete = tl.atomic_add(
-                        attention_counts + group,
-                        0,
-                        sem="acquire",
-                        scope="gpu",
+                if PARALLEL_TAIL and role < 3:
+                    attention_complete = _scheduler_acquire_load(
+                        attention_counts + group
                     )
                     while attention_complete < 2:
-                        attention_complete = tl.atomic_add(
-                            attention_counts + group,
-                            0,
-                            sem="acquire",
-                            scope="gpu",
+                        attention_complete = _scheduler_acquire_load(
+                            attention_counts + group
                         )
                     _publish_cta_writes()
                     half_row_start = group * S + (role - 1) * 64
-                    _parallel_s128_tail_half(
+                    _parallel_tail(
                         norm,
                         q,
                         v,
@@ -1773,6 +1932,7 @@ def _static_sequence_dag_megakernel(
                         layer == NUM_LAYERS - 1,
                         NUM_LAYERS,
                         LAYER_WEIGHTS,
+                        64,
                     )
                     tl.atomic_add(
                         tail_counts + group,
@@ -1781,17 +1941,14 @@ def _static_sequence_dag_megakernel(
                         scope="gpu",
                     )
             if S == 32 and role == 1 and PARALLEL_S32_ATTENTION:
-                complete = tl.atomic_add(
-                    qkv_counts + group, 0, sem="acquire", scope="gpu"
-                )
-                while complete < roles:
-                    complete = tl.atomic_add(
-                        qkv_counts + group, 0, sem="acquire", scope="gpu"
-                    )
+                complete = _scheduler_acquire_load(qkv_counts + group)
+                while complete < projection_roles:
+                    complete = _scheduler_acquire_load(qkv_counts + group)
                 _publish_cta_writes()
                 sequence = group * 2 + 1
                 sequence_offset = sequence * S * D
-                for head in range(0, H):
+                s32_role_heads: tl.constexpr = 2 if S32_FOUR_ROLES else H
+                for head in range(0, s32_role_heads):
                     _attention_mxhd(
                         q + sequence_offset,
                         k + sequence_offset,
@@ -1824,13 +1981,80 @@ def _static_sequence_dag_megakernel(
                     sem="release",
                     scope="gpu",
                 )
-            epoch = tl.atomic_add(
-                layer_epochs + group, 0, sem="acquire", scope="gpu"
-            )
-            while epoch < layer + 1:
-                epoch = tl.atomic_add(
-                    layer_epochs + group, 0, sem="acquire", scope="gpu"
+                if PARALLEL_S32_TAIL:
+                    attention_complete = _scheduler_acquire_load(
+                        attention_counts + group
+                    )
+                    while attention_complete < s32_attention_roles:
+                        attention_complete = _scheduler_acquire_load(
+                            attention_counts + group
+                        )
+                    _publish_cta_writes()
+                    _parallel_tail(
+                        norm,
+                        q,
+                        v,
+                        output_ptr,
+                        weights,
+                        residual,
+                        valid_ptr,
+                        packed_ptr,
+                        group * 64 + 32,
+                        D,
+                        LINEAR_REDUCTION_TILE,
+                        NORM_ALGORITHM,
+                        GELU_ALGORITHM,
+                        ALL_VALID,
+                        layer == NUM_LAYERS - 1,
+                        NUM_LAYERS,
+                        LAYER_WEIGHTS,
+                        32,
+                    )
+                    tl.atomic_add(
+                        tail_counts + group,
+                        1,
+                        sem="release",
+                        scope="gpu",
+                    )
+            if S == 32 and role >= 2 and S32_FOUR_ROLES:
+                sequence = group * 2 + (role - 2)
+                sequence_offset = sequence * S * D
+                for head in range(2, H):
+                    _attention_mxhd(
+                        q + sequence_offset,
+                        k + sequence_offset,
+                        v + sequence_offset,
+                        norm + sequence_offset,
+                        valid_ptr + sequence * S,
+                        workspace_ptr,
+                        workspace_ptr,
+                        workspace_ptr,
+                        workspace_ptr,
+                        0,
+                        head,
+                        S,
+                        D,
+                        HD,
+                        S,
+                        SCALE,
+                        False,
+                        SOFTMAX_ALGORITHM,
+                        DIVISION_ALGORITHM,
+                        EXP_ALGORITHM,
+                        ATTENTION_REDUCTION_TILE,
+                        ATTENTION_ROW_TILE,
+                        ALL_VALID,
+                    )
+                _publish_cta_writes()
+                tl.atomic_add(
+                    attention_counts + group,
+                    1,
+                    sem="release",
+                    scope="gpu",
                 )
+            epoch = _scheduler_acquire_load(layer_epochs + group)
+            while epoch < layer + 1:
+                epoch = _scheduler_acquire_load(layer_epochs + group)
 
 
 def dag_megakernel_forward(
@@ -1903,6 +2127,11 @@ def dag_megakernel_forward(
         ALL_VALID=all_valid,
         PARALLEL_TAIL=DAG_PARALLEL_TAIL and sequence == 128,
         PARALLEL_S32_ATTENTION=DAG_PARALLEL_S32_ATTENTION,
+        PARALLEL_S32_TAIL=DAG_PARALLEL_S32_TAIL,
+        S32_FOUR_ROLES=DAG_S32_FOUR_ROLES,
+        S128_FOUR_ROLES=DAG_S128_FOUR_ROLES,
+        PARALLEL_S128_NORM=DAG_PARALLEL_S128_NORM,
+        SPLIT_S128_Q=DAG_SPLIT_S128_Q,
         num_warps=tuning["num_warps"],
         num_stages=tuning["num_stages"],
     )

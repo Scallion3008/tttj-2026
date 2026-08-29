@@ -201,12 +201,17 @@ class SequenceResidentTransformer(nn.Module):
                     all_valid=self._last_mask_was_all_valid,
                 )
             else:
+                if self.dag_scheduler is None:
+                    raise RuntimeError("prepare() did not create the scheduler")
+                self._dag_epoch += 1
                 output = fused_megakernel_forward(
                     x,
                     valid_token_mask,
                     self.packed_weights,
                     num_heads=num_heads,
                     all_valid=self._last_mask_was_all_valid,
+                    scheduler=self.dag_scheduler,
+                    launch_epoch=self._dag_epoch,
                 )
             return output, None
         output, debug = load_extension().forward(

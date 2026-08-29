@@ -29,6 +29,8 @@ DTYPE_BYTES = 2
 H200_NVL_DENSE_FP16_TFLOPS = 835.5
 H200_SXM_DENSE_FP16_TFLOPS = 989.5
 H200_HBM_TBPS = 4.8
+H100_NVL_DENSE_FP16_TFLOPS = 835.5
+H100_NVL_HBM_TBPS = 3.9
 SHAPES = {
     2: (1, 128),
     3: (4, 128),
@@ -282,6 +284,7 @@ def run_accuracy(
             for padding_ratio in padding_ratios:
                 for scale in scales:
                     failed = 0
+                    repeat_failed = 0
                     max_abs = 0.0
                     worst = None
                     for trial in range(trials):
@@ -293,12 +296,15 @@ def run_accuracy(
                             padding_ratio,
                             scale,
                         )
+                        candidate = optimized(value, valid)
                         result = compare_outputs(
                             baseline(value, valid),
-                            optimized(value, valid),
+                            candidate,
                             rtol=0.01,
                             atol=0.001,
                         )
+                        repeated = optimized(value, valid)
+                        repeat_failed += int((candidate != repeated).sum().item())
                         failed += result.failed_elements
                         if result.max_abs_error >= max_abs:
                             max_abs = result.max_abs_error
@@ -307,13 +313,15 @@ def run_accuracy(
                                 result.reference_at_worst,
                                 result.optimized_at_worst,
                             )
-                    status = "PASS" if failed == 0 else "FAIL"
-                    passed &= failed == 0
+                    status = (
+                        "PASS" if failed == 0 and repeat_failed == 0 else "FAIL"
+                    )
+                    passed &= failed == 0 and repeat_failed == 0
                     print(
                         f"case {case_number:2d} padding={padding_ratio:.2f} "
                         f"scale={scale:g} {status} failed={failed}/"
                         f"{trials * config.batch_size * config.seq_len * MODEL} "
-                        f"max_abs={max_abs:.7g}"
+                        f"max_abs={max_abs:.7g} repeat_diff={repeat_failed}"
                     )
                     if failed:
                         print(f"  worst={worst}")
@@ -329,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--peak-tflops", type=float)
-    parser.add_argument("--peak-memory-tbps", type=float, default=H200_HBM_TBPS)
+    parser.add_argument("--peak-memory-tbps", type=float)
     return parser.parse_args()
 
 
@@ -339,17 +347,26 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("an NVIDIA GPU is required")
     properties = torch.cuda.get_device_properties(0)
-    if (properties.major, properties.minor) != (9, 0) or "H200" not in properties.name:
-        raise RuntimeError(f"an H200 sm_90 GPU is required, got {properties.name}")
+    if (
+        (properties.major, properties.minor) != (9, 0)
+        or ("H100" not in properties.name and "H200" not in properties.name)
+    ):
+        raise RuntimeError(f"an H100 or H200 sm_90 GPU is required, got {properties.name}")
     SEED = args.seed
     WARMUP = 10 if args.quick else 100
     REPETITIONS = 30 if args.quick else 500
-    PEAK_COMPUTE = args.peak_tflops or (
-        H200_NVL_DENSE_FP16_TFLOPS
-        if "NVL" in properties.name
-        else H200_SXM_DENSE_FP16_TFLOPS
-    )
-    PEAK_MEMORY = args.peak_memory_tbps
+    if "H100" in properties.name and "NVL" in properties.name:
+        default_peak = H100_NVL_DENSE_FP16_TFLOPS
+        default_memory = H100_NVL_HBM_TBPS
+    else:
+        default_peak = (
+            H200_NVL_DENSE_FP16_TFLOPS
+            if "NVL" in properties.name
+            else H200_SXM_DENSE_FP16_TFLOPS
+        )
+        default_memory = H200_HBM_TBPS
+    PEAK_COMPUTE = args.peak_tflops or default_peak
+    PEAK_MEMORY = args.peak_memory_tbps or default_memory
     cases = list(dict.fromkeys(args.cases))
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
