@@ -12,8 +12,7 @@ from triton.language.extra import libdevice
 
 SEQUENCE = 128
 MODEL = 128
-HEADS = 4
-HEAD_DIM = 32
+DEFAULT_HEADS = 4
 LAYERS = 4
 ELEMENTS = SEQUENCE * MODEL
 WORKSPACE_SLOTS = 3
@@ -22,7 +21,7 @@ TRACE_STAGES_PER_LAYER = 9
 TRACE_SLOTS = (
     LAYERS * TRACE_STAGES_PER_LAYER
     + 1
-    + 3 * HEADS * LAYERS
+    + 3 * DEFAULT_HEADS * LAYERS
     + LAYERS
 )
 
@@ -66,6 +65,10 @@ def _environment_integer(name: str, default: int) -> int:
     return int(os.environ.get(name, default))
 
 
+def _environment_is_set(name: str) -> bool:
+    return name in os.environ
+
+
 # Internal tuning switches make it possible to compare numerical/performance
 # trade-offs in isolated Slurm processes without maintaining source variants.
 NUM_CTAS = _environment_integer("TTTJ_NUM_CTAS", 1)
@@ -86,7 +89,8 @@ NUM_STAGES = _environment_integer("TTTJ_NUM_STAGES", 3)
 LINEAR_REDUCTION_TILE = _environment_integer("TTTJ_LINEAR_K", 64)
 ATTENTION_REDUCTION_TILE = _environment_integer("TTTJ_ATTENTION_K", 32)
 LINEAR_ROW_TILE = _environment_integer("TTTJ_LINEAR_M", 64)
-NORM_ROW_TILE = 64
+ATTENTION_ROW_TILE = _environment_integer("TTTJ_ATTENTION_M", 64)
+NORM_ROW_TILE = _environment_integer("TTTJ_NORM_M", 64)
 # Q overwrites its normalized input after K/V are produced, so the linear
 # output must cover the full row in one tile before that alias is safe.
 LINEAR_OUTPUT_TILE = 128
@@ -94,7 +98,37 @@ ALL_VALID_TOKENS = bool(_environment_integer("TTTJ_ALL_VALID", 0))
 EXPLICIT_BARRIERS = bool(_environment_integer("TTTJ_BARRIERS", 0))
 JIT_CLUSTERED = tl.constexpr(NUM_CTAS > 1)
 JIT_CLUSTER_THREADS = tl.constexpr(NUM_WARPS * 32)
-JIT_NORM_ROW_TILE = tl.constexpr(NORM_ROW_TILE)
+
+
+def resolved_megakernel_tuning(
+    batch_size: int,
+    num_heads: int,
+) -> dict[str, int]:
+    """Resolve shape defaults while retaining environment tuning overrides."""
+    step_3_shape = batch_size == 64 and NUM_CTAS == 1
+    num_warps = NUM_WARPS
+    linear_m = LINEAR_ROW_TILE
+    attention_m = ATTENTION_ROW_TILE
+    attention_k = ATTENTION_REDUCTION_TILE
+    norm_m = NORM_ROW_TILE
+    if step_3_shape:
+        if not _environment_is_set("TTTJ_NUM_WARPS"):
+            num_warps = 8
+        if not _environment_is_set("TTTJ_LINEAR_M"):
+            linear_m = 128
+        if not _environment_is_set("TTTJ_ATTENTION_M"):
+            attention_m = 128
+        if not _environment_is_set("TTTJ_ATTENTION_K"):
+            attention_k = 64 if num_heads == 2 else 32
+    return {
+        "num_warps": num_warps,
+        "num_stages": NUM_STAGES,
+        "linear_m": linear_m,
+        "linear_k": LINEAR_REDUCTION_TILE,
+        "attention_m": attention_m,
+        "attention_k": attention_k,
+        "norm_m": norm_m,
+    }
 
 
 @triton.jit
@@ -445,7 +479,7 @@ def _linear_tile(
 
 
 @triton.jit
-def _attention_64x32(
+def _attention_mxhd(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -467,12 +501,13 @@ def _attention_64x32(
     DIVISION_ALGORITHM: tl.constexpr,
     EXP_ALGORITHM: tl.constexpr,
     REDUCTION_TILE: tl.constexpr,
+    ROW_TILE: tl.constexpr,
     ALL_VALID: tl.constexpr,
 ):
-    queries = row_start + tl.arange(0, 64)
+    queries = row_start + tl.arange(0, ROW_TILE)
     keys = tl.arange(0, K)
     reductions = tl.arange(0, REDUCTION_TILE)
-    scores = tl.zeros((64, K), dtype=tl.float32)
+    scores = tl.zeros((ROW_TILE, K), dtype=tl.float32)
     for reduction_start in range(0, HD, REDUCTION_TILE):
         query_tile = tl.load(
             q_ptr
@@ -530,9 +565,9 @@ def _attention_64x32(
         # PersistentSoftmax assigns K / 32 columns to each warp lane, then
         # performs a shuffle-xor tree at offsets 16, 8, 4, 2, and 1.
         if K == 128:
-            lane_groups = tl.reshape(numerator, (64, 4, 32))
+            lane_groups = tl.reshape(numerator, (ROW_TILE, 4, 32))
             lane_groups = tl.permute(lane_groups, (0, 2, 1))
-            lane_pairs = tl.reshape(lane_groups, (64, 32, 2, 2))
+            lane_pairs = tl.reshape(lane_groups, (ROW_TILE, 32, 2, 2))
             even, odd = tl.split(lane_pairs)
             item0, item2 = tl.split(even)
             item1, item3 = tl.split(odd)
@@ -540,16 +575,16 @@ def _attention_64x32(
             lane_sum += item2
             lane_sum += item3
         else:
-            lane_groups = tl.reshape(numerator, (64, 2, 32))
+            lane_groups = tl.reshape(numerator, (ROW_TILE, 2, 32))
             lane_groups = tl.permute(lane_groups, (0, 2, 1))
             item0, item1 = tl.split(lane_groups)
             lane_sum = item0 + item1
-        denominator = _warp_add_halves(lane_sum, 64, 32)
-        denominator = _warp_add_halves(denominator, 64, 16)
-        denominator = _warp_add_halves(denominator, 64, 8)
-        denominator = _warp_add_halves(denominator, 64, 4)
-        denominator = _warp_add_halves(denominator, 64, 2)
-        denominator = tl.reshape(denominator, (64,))
+        denominator = _warp_add_halves(lane_sum, ROW_TILE, 32)
+        denominator = _warp_add_halves(denominator, ROW_TILE, 16)
+        denominator = _warp_add_halves(denominator, ROW_TILE, 8)
+        denominator = _warp_add_halves(denominator, ROW_TILE, 4)
+        denominator = _warp_add_halves(denominator, ROW_TILE, 2)
+        denominator = tl.reshape(denominator, (ROW_TILE,))
     else:
         denominator = tl.sum(numerator, axis=1)
     if CAPTURE:
@@ -590,7 +625,10 @@ def _attention_64x32(
             probabilities,
         )
 
-    value_columns = tl.arange(0, 32)
+    # HD is 32, 64, or 128 for benchmark cases 1, 10, and 9.  Emitting the
+    # whole head in one dot gives Hopper a natural WGMMA N tile and avoids
+    # repeating the probability load/softmax for multiple 32-column slices.
+    value_columns = tl.arange(0, HD)
     value_tile = tl.load(
         v_ptr
         + keys[:, None] * D
@@ -860,8 +898,10 @@ def _transformer_megakernel(
     SKIP_CAUSAL_TILES: tl.constexpr,
     LINEAR_K: tl.constexpr,
     ATTENTION_K: tl.constexpr,
+    ATTENTION_M: tl.constexpr,
     LINEAR_M: tl.constexpr,
     LINEAR_N: tl.constexpr,
+    NORM_M: tl.constexpr,
     WORKSPACE_STRIDE: tl.constexpr,
     ALL_VALID: tl.constexpr,
     USE_BARRIERS: tl.constexpr,
@@ -894,7 +934,7 @@ def _transformer_megakernel(
             attention_residual = saved_residual
         else:
             attention_residual = residual
-        for row_start in range(0, S, JIT_NORM_ROW_TILE):
+        for row_start in range(0, S, NORM_M):
             _layer_norm_half(
                 residual,
                 norm,
@@ -903,7 +943,7 @@ def _transformer_megakernel(
                 weights + JIT_NORM1_BIAS,
                 row_start,
                 D,
-                JIT_NORM_ROW_TILE,
+                NORM_M,
                 NORM_ALGORITHM,
                 CLUSTERED,
             )
@@ -996,7 +1036,7 @@ def _transformer_megakernel(
                 )
             else:
                 if SKIP_CAUSAL_TILES:
-                    _attention_64x32(
+                    _attention_mxhd(
                         q,
                         k,
                         v,
@@ -1018,9 +1058,10 @@ def _transformer_megakernel(
                         DIVISION_ALGORITHM,
                         EXP_ALGORITHM,
                         ATTENTION_K,
+                        64,
                         ALL_VALID,
                     )
-                    _attention_64x32(
+                    _attention_mxhd(
                         q,
                         k,
                         v,
@@ -1042,11 +1083,12 @@ def _transformer_megakernel(
                         DIVISION_ALGORITHM,
                         EXP_ALGORITHM,
                         ATTENTION_K,
+                        64,
                         ALL_VALID,
                     )
                 else:
-                    for row_start in range(0, S, 64):
-                        _attention_64x32(
+                    for row_start in range(0, S, ATTENTION_M):
+                        _attention_mxhd(
                             q,
                             k,
                             v,
@@ -1068,6 +1110,7 @@ def _transformer_megakernel(
                             DIVISION_ALGORITHM,
                             EXP_ALGORITHM,
                             ATTENTION_K,
+                            ATTENTION_M,
                             ALL_VALID,
                         )
         if USE_BARRIERS and not CLUSTERED:
@@ -1097,7 +1140,7 @@ def _transformer_megakernel(
             _stage_barrier(CLUSTERED)
         _trace_tensor(k, trace_ptr, layer * 9 + 5, E, CAPTURE)
 
-        for row_start in range(0, S, JIT_NORM_ROW_TILE):
+        for row_start in range(0, S, NORM_M):
             _layer_norm_half(
                 k,
                 norm,
@@ -1106,7 +1149,7 @@ def _transformer_megakernel(
                 weights + JIT_NORM2_BIAS,
                 row_start,
                 D,
-                JIT_NORM_ROW_TILE,
+                NORM_M,
                 NORM_ALGORITHM,
                 False,
             )
@@ -1169,7 +1212,7 @@ def _transformer_megakernel(
     sequence_output = x
     final_input = norm if CLUSTERED else x
     if ALL_VALID:
-        for row_start in range(0, S, JIT_NORM_ROW_TILE):
+        for row_start in range(0, S, NORM_M):
             _layer_norm_half(
                 final_input,
                 sequence_output,
@@ -1178,7 +1221,7 @@ def _transformer_megakernel(
                 final_norm_bias,
                 row_start,
                 D,
-                JIT_NORM_ROW_TILE,
+                NORM_M,
                 FINAL_NORM_ALGORITHM,
                 False,
             )
@@ -1189,7 +1232,7 @@ def _transformer_megakernel(
             )
     else:
         final_norm_scratch = k if CLUSTERED else norm
-        for row_start in range(0, S, JIT_NORM_ROW_TILE):
+        for row_start in range(0, S, NORM_M):
             _layer_norm_half(
                 final_input,
                 final_norm_scratch,
@@ -1198,7 +1241,7 @@ def _transformer_megakernel(
                 final_norm_bias,
                 row_start,
                 D,
-                JIT_NORM_ROW_TILE,
+                NORM_M,
                 FINAL_NORM_ALGORITHM,
                 False,
             )
@@ -1231,14 +1274,32 @@ def fused_megakernel_forward(
     valid_mask: torch.Tensor,
     packed_weights: torch.Tensor,
     *,
+    num_heads: int = DEFAULT_HEADS,
     capture_trace: bool = False,
     all_valid: bool | None = None,
 ):
     batch_size = value.shape[0]
     if all_valid is None:
         all_valid = ALL_VALID_TOKENS
-    if capture_trace and batch_size != 1:
-        raise ValueError("trace capture supports exactly one sequence")
+    if num_heads not in (1, 2, 4):
+        raise ValueError(f"supported head counts are 1, 2, and 4; got {num_heads}")
+    head_dim = MODEL // num_heads
+    if capture_trace and (batch_size != 1 or num_heads != DEFAULT_HEADS):
+        raise ValueError("trace capture supports one sequence with four heads")
+    if NUM_CTAS > 1 and num_heads != DEFAULT_HEADS:
+        raise ValueError("the experimental clustered path supports four heads only")
+    tuning = resolved_megakernel_tuning(batch_size, num_heads)
+    if SEQUENCE % tuning["linear_m"] != 0:
+        raise ValueError("TTTJ_LINEAR_M must divide 128")
+    if SEQUENCE % tuning["attention_m"] != 0:
+        raise ValueError("TTTJ_ATTENTION_M must divide 128")
+    if SEQUENCE % tuning["norm_m"] != 0:
+        raise ValueError("TTTJ_NORM_M must divide 128")
+    if (
+        tuning["attention_k"] > head_dim
+        or head_dim % tuning["attention_k"] != 0
+    ):
+        raise ValueError("TTTJ_ATTENTION_K must divide and not exceed head_dim")
     workspace_slots = CLUSTER_WORKSPACE_SLOTS if NUM_CTAS > 1 else WORKSPACE_SLOTS
     workspace = torch.empty(
         (batch_size, workspace_slots, SEQUENCE, MODEL),
@@ -1264,12 +1325,12 @@ def fused_megakernel_forward(
         trace,
         S=SEQUENCE,
         D=MODEL,
-        H=HEADS,
-        HD=HEAD_DIM,
+        H=num_heads,
+        HD=head_dim,
         NUM_LAYERS=LAYERS,
         E=ELEMENTS,
         LAYER_WEIGHTS=LAYER_STRIDE,
-        SCALE=HEAD_DIM ** -0.5,
+        SCALE=head_dim ** -0.5,
         CAPTURE=capture_trace,
         NORM_ALGORITHM=NORM_MODE,
         FINAL_NORM_ALGORITHM=FINAL_NORM_MODE,
@@ -1278,16 +1339,18 @@ def fused_megakernel_forward(
         EXP_ALGORITHM=EXP_MODE,
         GELU_ALGORITHM=GELU_MODE,
         SKIP_CAUSAL_TILES=CAUSAL_SKIP,
-        LINEAR_K=LINEAR_REDUCTION_TILE,
-        ATTENTION_K=ATTENTION_REDUCTION_TILE,
-        LINEAR_M=LINEAR_ROW_TILE,
+        LINEAR_K=tuning["linear_k"],
+        ATTENTION_K=tuning["attention_k"],
+        ATTENTION_M=tuning["attention_m"],
+        LINEAR_M=tuning["linear_m"],
         LINEAR_N=LINEAR_OUTPUT_TILE,
+        NORM_M=tuning["norm_m"],
         WORKSPACE_STRIDE=workspace_slots,
         ALL_VALID=all_valid,
         USE_BARRIERS=EXPLICIT_BARRIERS or capture_trace,
         CLUSTERED=NUM_CTAS > 1,
-        num_warps=NUM_WARPS,
+        num_warps=tuning["num_warps"],
         num_ctas=NUM_CTAS,
-        num_stages=NUM_STAGES,
+        num_stages=tuning["num_stages"],
     )
     return (output, trace) if capture_trace else output

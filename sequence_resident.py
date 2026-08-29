@@ -14,11 +14,11 @@ from fused_megakernel import fused_megakernel_forward
 
 SEQUENCE_LENGTH = 128
 MODEL_DIMENSION = 128
-NUMBER_OF_HEADS = 4
+DEFAULT_NUMBER_OF_HEADS = 4
 NUMBER_OF_LAYERS = 4
 
 _ELEMENTS = SEQUENCE_LENGTH * MODEL_DIMENSION
-_SCORE_ELEMENTS = NUMBER_OF_HEADS * SEQUENCE_LENGTH * SEQUENCE_LENGTH
+_SCORE_ELEMENTS = DEFAULT_NUMBER_OF_HEADS * SEQUENCE_LENGTH * SEQUENCE_LENGTH
 
 _DEBUG_LAYOUT = (
     ("layernorm", _ELEMENTS, (SEQUENCE_LENGTH, MODEL_DIMENSION)),
@@ -28,12 +28,12 @@ _DEBUG_LAYOUT = (
     (
         "scores",
         _SCORE_ELEMENTS,
-        (NUMBER_OF_HEADS, SEQUENCE_LENGTH, SEQUENCE_LENGTH),
+        (DEFAULT_NUMBER_OF_HEADS, SEQUENCE_LENGTH, SEQUENCE_LENGTH),
     ),
     (
         "softmax",
         _SCORE_ELEMENTS,
-        (NUMBER_OF_HEADS, SEQUENCE_LENGTH, SEQUENCE_LENGTH),
+        (DEFAULT_NUMBER_OF_HEADS, SEQUENCE_LENGTH, SEQUENCE_LENGTH),
     ),
     ("pv", _ELEMENTS, (SEQUENCE_LENGTH, MODEL_DIMENSION)),
     ("output_projection", _ELEMENTS, (SEQUENCE_LENGTH, MODEL_DIMENSION)),
@@ -67,9 +67,8 @@ def _append_linear(tensors: list[torch.Tensor], linear: nn.Linear) -> None:
 
 
 def pack_model_weights(model: nn.Module) -> torch.Tensor:
-    """Pack the fixed case-5/6 parameter layout into one contiguous tensor."""
+    """Pack the fixed D128/F128/L4 parameter layout contiguously."""
     config = model.config
-    expected = (128, 4, 128, 4, True)
     actual = (
         config.d_model,
         config.num_heads,
@@ -77,9 +76,15 @@ def pack_model_weights(model: nn.Module) -> torch.Tensor:
         config.num_layers,
         config.causal,
     )
-    if actual != expected:
+    if (
+        config.d_model != 128
+        or config.num_heads not in (1, 2, 4)
+        or config.ffn_dim != 128
+        or config.num_layers != 4
+        or not config.causal
+    ):
         raise ValueError(
-            "sequence-resident v1 only supports D=128, H=4, F=128, "
+            "sequence-resident v1 only supports D=128, H in {1,2,4}, F=128, "
             f"L=4, causal=True; got {actual}"
         )
 
@@ -149,6 +154,9 @@ class SequenceResidentTransformer(nn.Module):
                 x.shape[:2], device=x.device, dtype=torch.bool
             )
         self._ensure_prepared(x)
+        num_heads = self.parameter_model.config.num_heads
+        if capture_debug and num_heads != DEFAULT_NUMBER_OF_HEADS:
+            raise ValueError("CUDA debug capture supports four heads only")
         if not capture_debug:
             try:
                 mask_version: Optional[int] = valid_token_mask._version
@@ -175,6 +183,7 @@ class SequenceResidentTransformer(nn.Module):
                     x,
                     valid_token_mask,
                     self.packed_weights,
+                    num_heads=num_heads,
                     all_valid=self._last_mask_was_all_valid,
                 ),
                 None,

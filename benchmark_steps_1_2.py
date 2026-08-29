@@ -121,12 +121,13 @@ def make_models(
     batch_size: int,
     seed: int,
     verbose_build: bool,
+    num_heads: int = 4,
 ) -> Tuple[BaselineTransformer, SequenceResidentTransformer, TransformerConfig]:
     config = TransformerConfig(
         batch_size=batch_size,
         seq_len=128,
         d_model=128,
-        num_heads=4,
+        num_heads=num_heads,
         ffn_dim=128,
         num_layers=4,
         causal=True,
