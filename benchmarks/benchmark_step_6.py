@@ -13,14 +13,17 @@ import torch.nn.functional as F
 import triton
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from layerwise_hybrid import GraphedHybridTransformer, LayerwiseHybridTransformer
-from case8_attention import attention_tuning, packed_causal_attention
-from case8_fusions import fusion_tuning, residual_layer_norm
-from torch_transformer_benchmark import (
+from benchmarks.torch_transformer_benchmark import (
     BaselineTransformer,
     TransformerConfig,
     compare_outputs,
     generate_random_case,
+)
+from kernels.case8_attention import attention_tuning, packed_causal_attention
+from kernels.case8_fusions import fusion_tuning, residual_layer_norm
+from kernels.layerwise_hybrid import (
+    GraphedHybridTransformer,
+    LayerwiseHybridTransformer,
 )
 
 

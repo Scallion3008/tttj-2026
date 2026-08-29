@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-wgmma
-#SBATCH --output=job-scripts/run_wgmma_quick_h200-%j.out
+#SBATCH --output=job-scripts/outputs/run_wgmma_quick_h200-%j.out
 #SBATCH --time=00:20:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -26,4 +26,5 @@ benchmark_args=(--mode benchmarks)
 if [[ "${BENCH_QUICK:-1}" == "1" ]]; then
     benchmark_args+=(--quick)
 fi
-uv run --frozen python benchmark_steps_1_2.py "${benchmark_args[@]}" "$@"
+uv run --frozen python -m benchmarks.benchmark_steps_1_2 \
+    "${benchmark_args[@]}" "$@"

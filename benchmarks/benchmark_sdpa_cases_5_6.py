@@ -9,9 +9,9 @@ import copy
 import torch
 import triton
 
-from benchmark_step_4 import SDPATransformer
-from benchmark_steps_1_2 import make_models
-from torch_transformer_benchmark import compare_outputs, generate_random_case
+from benchmarks.benchmark_step_4 import SDPATransformer
+from benchmarks.benchmark_steps_1_2 import make_models
+from benchmarks.torch_transformer_benchmark import compare_outputs, generate_random_case
 
 
 def main() -> int:

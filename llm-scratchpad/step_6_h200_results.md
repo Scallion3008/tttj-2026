@@ -141,7 +141,7 @@ sbatch --gres=gpu:h200-141:1 job-scripts/run_step_6_h200.sh \
 
 # Common integrated dispatcher
 sbatch --gres=gpu:h200-141:1 \
-  --output=job-scripts/step6-integrated-%j.out \
+  --output=job-scripts/outputs/step6-integrated-%j.out \
   job-scripts/benchmark_megakernels_h100.sh \
   --cases 8 --warmup 100 --rep 500
 

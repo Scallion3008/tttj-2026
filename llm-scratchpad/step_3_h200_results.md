@@ -25,7 +25,7 @@ The viable plan was therefore:
 
 ## Final implementation
 
-`fused_megakernel.py` automatically selects the following schedule when
+`kernels/fused_megakernel.py` automatically selects the following schedule when
 `B=64`, `S=D=F=128`, and `H` is 1, 2, or 4:
 
 | Parameter | Case 9, H=1 | Case 10, H=2 | Case 1, H=4 |
@@ -49,7 +49,7 @@ only.
 
 ## Roofline method
 
-`benchmark_step_3.py` owns the correctness and performance harness.  It uses a
+`benchmarks/benchmark_step_3.py` owns the correctness and performance harness.  It uses a
 `triton.testing.Benchmark` descriptor and `triton.testing.do_bench`; its text
 report does not require the optional matplotlib package.
 

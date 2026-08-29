@@ -462,7 +462,7 @@ for orchestration rather than a model-wide kernel.
 ## Correctness constraints
 
 The optimized implementation must match the boundaries in
-[`torch_transformer_benchmark.py`](../torch_transformer_benchmark.py), not just
+[`torch_transformer_benchmark.py`](../benchmarks/torch_transformer_benchmark.py), not just
 the transformer equation in abstract.
 
 - Accumulate LayerNorm statistics and online-softmax state in FP32.

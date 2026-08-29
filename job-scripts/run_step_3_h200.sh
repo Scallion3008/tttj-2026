@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-step3
-#SBATCH --output=job-scripts/run_step_3_h200-%j.out
+#SBATCH --output=job-scripts/outputs/run_step_3_h200-%j.out
 #SBATCH --time=00:30:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -26,4 +26,5 @@ benchmark_args=()
 if [[ "${BENCH_QUICK:-0}" == "1" ]]; then
     benchmark_args+=(--quick)
 fi
-uv run --frozen python benchmark_step_3.py "${benchmark_args[@]}" "$@"
+uv run --frozen python -m benchmarks.benchmark_step_3 \
+    "${benchmark_args[@]}" "$@"

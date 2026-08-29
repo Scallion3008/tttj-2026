@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-env
-#SBATCH --output=job-scripts/check_h100_env-%j.out
+#SBATCH --output=job-scripts/outputs/check_h100_env-%j.out
 #SBATCH --time=00:05:00
 
 set -euo pipefail

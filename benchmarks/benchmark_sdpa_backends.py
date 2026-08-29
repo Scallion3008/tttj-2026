@@ -11,13 +11,13 @@ import torch
 import triton
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from benchmark_step_4 import SDPATransformer
-from profile_megakernel import CASES
-from torch_transformer_benchmark import (
+from benchmarks.benchmark_step_4 import SDPATransformer
+from benchmarks.torch_transformer_benchmark import (
     BaselineTransformer,
     TransformerConfig,
     generate_random_case,
 )
+from optimized_transformer import IMPLEMENTED_CASES
 
 
 BACKENDS = {
@@ -30,7 +30,13 @@ BACKENDS = {
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", nargs="+", type=int, choices=CASES, default=CASES)
+    parser.add_argument(
+        "--cases",
+        nargs="+",
+        type=int,
+        choices=IMPLEMENTED_CASES,
+        default=IMPLEMENTED_CASES,
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--rep", type=int, default=300)
     parser.add_argument("--allow-h200", action="store_true")
@@ -51,7 +57,7 @@ def main() -> int:
 
     with torch.inference_mode():
         for case_number in dict.fromkeys(args.cases):
-            batch, sequence, model_dimension, heads = CASES[case_number]
+            batch, sequence, model_dimension, heads = IMPLEMENTED_CASES[case_number]
             config = TransformerConfig(
                 batch_size=batch,
                 seq_len=sequence,

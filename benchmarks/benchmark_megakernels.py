@@ -8,16 +8,43 @@ import argparse
 import torch
 import triton
 
-from case8_attention import attention_tuning
-from dag_megakernel import is_step_4_shape, resolved_dag_tuning
-from fused_megakernel import resolved_megakernel_tuning
-from profile_megakernel import CASES, make_case
-from torch_transformer_benchmark import generate_random_case
+from benchmarks.torch_transformer_benchmark import (
+    BaselineTransformer,
+    TransformerConfig,
+    generate_random_case,
+)
+from kernels.case8_attention import attention_tuning
+from kernels.dag_megakernel import is_step_4_shape, resolved_dag_tuning
+from kernels.fused_megakernel import resolved_megakernel_tuning
+from optimized_transformer import IMPLEMENTED_CASES, make_optimized_transformer
+
+
+def make_case(case_number: int):
+    batch, sequence, model, heads = IMPLEMENTED_CASES[case_number]
+    config = TransformerConfig(
+        batch_size=batch,
+        seq_len=sequence,
+        d_model=model,
+        num_heads=heads,
+        ffn_dim=model,
+        num_layers=4,
+        causal=True,
+    )
+    torch.manual_seed(1234)
+    baseline = BaselineTransformer(config).cuda().half().eval()
+    optimized = make_optimized_transformer(baseline).cuda().eval()
+    return optimized, config
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", nargs="+", type=int, choices=CASES, default=CASES)
+    parser.add_argument(
+        "--cases",
+        nargs="+",
+        type=int,
+        choices=IMPLEMENTED_CASES,
+        default=IMPLEMENTED_CASES,
+    )
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--rep", type=int, default=500)
     args = parser.parse_args()
@@ -57,7 +84,7 @@ def main() -> int:
                 rep=args.rep,
                 quantiles=[0.5, 0.2, 0.8],
             )
-            batch, sequence, model, heads = CASES[case_number]
+            batch, sequence, model, heads = IMPLEMENTED_CASES[case_number]
             if case_number == 8:
                 family = "hybrid"
                 tuning = attention_tuning()

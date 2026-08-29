@@ -5,9 +5,9 @@ import os
 import torch
 import torch.nn.functional as F
 
-from benchmark_steps_1_2 import compare_stage, make_models
-from fused_megakernel import fused_megakernel_forward
-from torch_transformer_benchmark import generate_random_case
+from benchmarks.benchmark_steps_1_2 import compare_stage, make_models
+from benchmarks.torch_transformer_benchmark import generate_random_case
+from kernels.fused_megakernel import fused_megakernel_forward
 
 
 batch_size = int(os.environ.get("DIAG_BATCH", "1"))

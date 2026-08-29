@@ -11,9 +11,9 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from benchmark_steps_1_2 import make_models
-from fused_megakernel import resolved_megakernel_tuning
-from torch_transformer_benchmark import compare_outputs, generate_random_case
+from benchmarks.benchmark_steps_1_2 import make_models
+from benchmarks.torch_transformer_benchmark import compare_outputs, generate_random_case
+from kernels.fused_megakernel import resolved_megakernel_tuning
 
 
 BATCH = 64

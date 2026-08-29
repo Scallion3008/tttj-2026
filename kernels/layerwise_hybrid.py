@@ -16,8 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from case8_attention import packed_causal_attention
-from case8_fusions import residual_layer_norm
+from kernels.case8_attention import packed_causal_attention
+from kernels.case8_fusions import residual_layer_norm
 
 
 CASE8_BATCH = 64

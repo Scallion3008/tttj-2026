@@ -9,12 +9,12 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
 
-from dag_megakernel import (
+from kernels.dag_megakernel import (
     SCHEDULER_ELEMENTS,
     dag_megakernel_forward,
     is_step_4_shape,
 )
-from fused_megakernel import fused_megakernel_forward
+from kernels.fused_megakernel import fused_megakernel_forward
 
 
 SEQUENCE_LENGTH = 128

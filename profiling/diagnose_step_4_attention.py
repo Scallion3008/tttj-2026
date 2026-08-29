@@ -9,10 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
-from benchmark_step_4 import models_for_case
-from benchmark_steps_1_2 import compare_stage
-from fused_megakernel import _attention_mxhd
-from torch_transformer_benchmark import generate_random_case
+from benchmarks.benchmark_step_4 import models_for_case
+from benchmarks.benchmark_steps_1_2 import compare_stage
+from benchmarks.torch_transformer_benchmark import generate_random_case
+from kernels.fused_megakernel import _attention_mxhd
 
 
 @triton.jit

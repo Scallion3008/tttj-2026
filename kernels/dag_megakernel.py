@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from fused_megakernel import (
+from kernels.fused_megakernel import (
     ATTENTION_REDUCTION_TILE,
     DIVISION_MODE,
     EXP_MODE,

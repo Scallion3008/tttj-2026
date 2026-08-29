@@ -12,8 +12,7 @@ from typing import Dict, Iterable, Tuple
 import torch
 import torch.nn.functional as F
 
-from sequence_resident import SequenceResidentTransformer
-from torch_transformer_benchmark import (
+from benchmarks.torch_transformer_benchmark import (
     BaselineTransformer,
     TransformerConfig,
     benchmark_models,
@@ -21,6 +20,7 @@ from torch_transformer_benchmark import (
     generate_random_case,
     run_accuracy_tests,
 )
+from optimized_transformer import make_optimized_transformer
 
 
 STRICT_ATOL = 0.001
@@ -135,11 +135,10 @@ def make_models(
     torch.manual_seed(seed)
     baseline = BaselineTransformer(config).cuda().half().eval()
     parameter_model = copy.deepcopy(baseline)
-    optimized = SequenceResidentTransformer(
+    optimized = make_optimized_transformer(
         parameter_model,
         verbose_build=verbose_build,
     ).cuda().eval()
-    optimized.prepare()
     return baseline, optimized, config
 
 

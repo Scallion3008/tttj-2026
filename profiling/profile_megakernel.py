@@ -14,40 +14,16 @@ import copy
 
 import torch
 
-from benchmark_steps_1_2 import make_models
-from layerwise_hybrid import Case8OptimizedTransformer
-from sequence_resident import SequenceResidentTransformer
-from torch_transformer_benchmark import (
+from benchmarks.torch_transformer_benchmark import (
     BaselineTransformer,
     TransformerConfig,
     generate_random_case,
 )
-
-
-CASES = {
-    1: (64, 128, 128, 4),
-    2: (1, 128, 128, 4),
-    3: (4, 128, 128, 4),
-    4: (16, 128, 128, 4),
-    5: (128, 128, 128, 4),
-    6: (10000, 128, 128, 4),
-    7: (64, 128, 32, 4),
-    8: (64, 128, 1024, 4),
-    9: (64, 128, 128, 1),
-    10: (64, 128, 128, 2),
-    11: (64, 128, 128, 16),
-    12: (64, 32, 128, 4),
-}
+from optimized_transformer import IMPLEMENTED_CASES, make_optimized_transformer
 
 
 def make_case(case_number: int):
-    batch, sequence, model, heads = CASES[case_number]
-    if sequence == 128 and model == 128 and heads in (1, 2, 4):
-        _, optimized, config = make_models(
-            batch, 1234, False, num_heads=heads
-        )
-        return optimized, config
-
+    batch, sequence, model, heads = IMPLEMENTED_CASES[case_number]
     config = TransformerConfig(
         batch_size=batch,
         seq_len=sequence,
@@ -59,17 +35,15 @@ def make_case(case_number: int):
     )
     torch.manual_seed(1234)
     baseline = BaselineTransformer(config).cuda().half().eval()
-    if case_number == 8:
-        optimized = Case8OptimizedTransformer(copy.deepcopy(baseline)).cuda().eval()
-    else:
-        optimized = SequenceResidentTransformer(copy.deepcopy(baseline)).cuda().eval()
-        optimized.prepare()
+    optimized = make_optimized_transformer(copy.deepcopy(baseline)).cuda().eval()
     return optimized, config
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", type=int, choices=CASES, required=True)
+    parser.add_argument(
+        "--case", type=int, choices=IMPLEMENTED_CASES, required=True
+    )
     parser.add_argument("--warmup", type=int, default=2)
     args = parser.parse_args()
 

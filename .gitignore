@@ -1,3 +1,4 @@
 __pycache__/
 *.py[cod]
 job-scripts/*.out
+job-scripts/outputs/*.out

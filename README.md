@@ -30,14 +30,37 @@ class BaselineTransformerBlock(nn.Module):
         return x
 ```
 
-where the full Transformer is simply a composition of these blocks, followed by normalization and masking. For the full architecture, see the [organizer-provided benchmark file](torch_transformer_benchmark.py).
+where the full Transformer is simply a composition of these blocks, followed by normalization and masking. For the full architecture, see the [organizer-provided benchmark file](benchmarks/torch_transformer_benchmark.py).
 
 
 ## Approach
 
 We aim to beat trivial optimizations like PyTorch SDPA and cuDNN attention kernels by implementing the full transformer (including all its constituent blocks) as a megakernel.
 
-TODO add more details
+Production callers use one constructor for every implemented case:
+
+```python
+import copy
+
+from optimized_transformer import make_optimized_transformer
+
+optimized = make_optimized_transformer(copy.deepcopy(baseline)).eval()
+output = optimized(value, valid_token_mask)
+```
+
+The supplied model must already contain CUDA FP16 parameters. The constructor
+detects its benchmark case from `model.config`, prepares the appropriate
+resident/DAG/hybrid implementation, and rejects unsupported shapes.
+
+## Repository layout
+
+- `optimized_transformer.py`: public optimized-model constructor and case map.
+- `kernels/`: Triton kernels, optimized model adapters, and CUDA sources.
+- `benchmarks/`: organizer reference plus correctness and latency benchmarks.
+- `profiling/`: profiling, numerical validation, and diagnostic entrypoints.
+- `job-scripts/`: Slurm scripts only.
+- `job-scripts/outputs/`: Slurm logs and Nsight report artifacts.
+- `llm-scratchpad/`: optimization notes and recorded results.
 
 
 
@@ -45,7 +68,7 @@ TODO add more details
 
 **Hard numerical gate vs PyTorch:** absolute error < 0.001, relative error < 0.01.
 
-Numerical correctness test is located in [torch_transformer_benchmark.py](torch_transformer_benchmark.py).
+Numerical correctness utilities are located in [benchmarks/torch_transformer_benchmark.py](benchmarks/torch_transformer_benchmark.py).
 
 
 ### Performance evaluation

@@ -19,7 +19,7 @@ The two production families are now:
 
 ## Final latency and fastest PyTorch SDPA baseline
 
-`benchmark_sdpa_backends.py` measured auto-selection and forced cuDNN, Flash,
+`benchmarks/benchmark_sdpa_backends.py` measured auto-selection and forced cuDNN, Flash,
 memory-efficient, and math SDPA.  Memory-efficient attention was fastest for
 all cases except case 6, where auto-selection won.  cuDNN 9.24 was available
 but was not the fastest backend for these shapes.
@@ -43,7 +43,7 @@ improved from 12.77 to 12.27 ms while dynamic shared memory fell from 73.73 to
 
 ## Final Nsight Compute profile
 
-Reports are `job-scripts/ncu_h100_case*_771916.ncu-rep`; text exports use the
+Reports are `job-scripts/outputs/ncu_h100_case*_771916.ncu-rep`; text exports use the
 same names with `.txt`.  All percentages are Nsight's peak-normalized values.
 
 | Case | Duration | Grid | SM compute | Memory | DRAM | Achieved occupancy | No eligible |

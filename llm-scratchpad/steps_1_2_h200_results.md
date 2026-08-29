@@ -38,7 +38,7 @@ Result: **PASS for all nine stages in all 18 scale/padding combinations.**
 The largest observed normalized gate consumption was 0.5493 at the FFN
 checkpoint; all checkpoints therefore retained at least about 1.82x margin to
 the strict gate in this sweep. The authoritative log is
-`job-scripts/run_step_1_h200-768637.out`.
+`job-scripts/outputs/run_step_1_h200-768637.out`.
 
 The first run incorrectly compared raw PV values for invalid query rows even
 though the prototype zeroed those rows early and the reference zeroed them

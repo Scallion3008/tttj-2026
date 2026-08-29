@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-gate
-#SBATCH --output=job-scripts/validate_fused_gate_h200-%j.out
+#SBATCH --output=job-scripts/outputs/validate_fused_gate_h200-%j.out
 #SBATCH --time=00:10:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -20,4 +20,4 @@ export CUDA_MODULE_LOADING=LAZY
 
 hostname
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
-uv run --frozen python validate_fused_gate.py
+uv run --frozen python -m profiling.validate_fused_gate

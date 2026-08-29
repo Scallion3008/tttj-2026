@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-s4-attn
-#SBATCH --output=job-scripts/diagnose_step_4_attention_h200-%j.out
+#SBATCH --output=job-scripts/outputs/diagnose_step_4_attention_h200-%j.out
 #SBATCH --time=00:10:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
@@ -18,4 +18,4 @@ export LD_LIBRARY_PATH="${CUDA_ROOT}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}
 
 hostname
 nvcc --version
-uv run --frozen python diagnose_step_4_attention.py "$@"
+uv run --frozen python -m profiling.diagnose_step_4_attention "$@"

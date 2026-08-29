@@ -11,14 +11,14 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from dag_megakernel import resolved_dag_tuning
-from sequence_resident import SequenceResidentTransformer
-from torch_transformer_benchmark import (
+from benchmarks.torch_transformer_benchmark import (
     BaselineTransformer,
     TransformerConfig,
     compare_outputs,
     generate_random_case,
 )
+from kernels.dag_megakernel import resolved_dag_tuning
+from optimized_transformer import make_optimized_transformer
 
 
 MODEL = 128
@@ -180,8 +180,7 @@ def models_for_case(case_number: int):
         )
         torch.manual_seed(SEED)
         baseline = BaselineTransformer(config).cuda().half().eval()
-        optimized = SequenceResidentTransformer(copy.deepcopy(baseline)).cuda().eval()
-        optimized.prepare()
+        optimized = make_optimized_transformer(copy.deepcopy(baseline)).cuda().eval()
         sdpa = SDPATransformer(copy.deepcopy(baseline)).cuda().eval()
         value, valid = generate_random_case(
             config,

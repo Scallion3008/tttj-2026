@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-ncu
-#SBATCH --output=job-scripts/profile_megakernel_h200-%j.out
+#SBATCH --output=job-scripts/outputs/profile_megakernel_h200-%j.out
 #SBATCH --time=00:30:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -34,8 +34,8 @@ else
     )
 fi
 
-for batch_size in ${PROFILE_BATCHES:-128 10000}; do
-    report="job-scripts/ncu_megakernel_b${batch_size}_${SLURM_JOB_ID}"
+for case_number in ${PROFILE_CASES:-5 6}; do
+    report="job-scripts/outputs/ncu_megakernel_case${case_number}_${SLURM_JOB_ID}"
     "${NCU}" \
         --force-overwrite \
         --target-processes all \
@@ -44,6 +44,7 @@ for batch_size in ${PROFILE_BATCHES:-128 10000}; do
         --launch-count 1 \
         "${profile_sections[@]}" \
         --export "${report}" \
-        uv run --frozen python profile_megakernel.py --batch-size "${batch_size}"
+        uv run --frozen python -m profiling.profile_megakernel \
+            --case "${case_number}"
     "${NCU}" --import "${report}.ncu-rep" --page details > "${report}.txt"
 done

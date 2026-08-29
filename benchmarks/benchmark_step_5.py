@@ -12,18 +12,18 @@ import torch.nn.functional as F
 import triton
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from fused_megakernel import (
-    HD8_PV_MODE,
-    HD8_QK_MODE,
-    resolved_megakernel_tuning,
-)
-from sequence_resident import SequenceResidentTransformer
-from torch_transformer_benchmark import (
+from benchmarks.torch_transformer_benchmark import (
     BaselineTransformer,
     TransformerConfig,
     compare_outputs,
     generate_random_case,
 )
+from kernels.fused_megakernel import (
+    HD8_PV_MODE,
+    HD8_QK_MODE,
+    resolved_megakernel_tuning,
+)
+from optimized_transformer import make_optimized_transformer
 
 
 SEQUENCE = 128
@@ -173,8 +173,7 @@ def models_for_case(case_number: int):
         )
         torch.manual_seed(SEED)
         baseline = BaselineTransformer(config).cuda().half().eval()
-        optimized = SequenceResidentTransformer(copy.deepcopy(baseline)).cuda().eval()
-        optimized.prepare()
+        optimized = make_optimized_transformer(copy.deepcopy(baseline)).cuda().eval()
         sdpa = SDPATransformer(copy.deepcopy(baseline)).cuda().eval()
         value, valid = generate_random_case(
             config,

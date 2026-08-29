@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-step1
-#SBATCH --output=job-scripts/run_step_1_h200-%j.out
+#SBATCH --output=job-scripts/outputs/run_step_1_h200-%j.out
 #SBATCH --time=00:20:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -28,4 +28,5 @@ hostname
 nvcc --version
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 
-uv run --frozen python benchmark_steps_1_2.py --mode checkpoints --verbose-build
+uv run --frozen python -m benchmarks.benchmark_steps_1_2 \
+    --mode checkpoints --verbose-build

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tttj-sdpa-h100
-#SBATCH --output=job-scripts/benchmark_sdpa_cases_5_6_h100-%j.out
+#SBATCH --output=job-scripts/outputs/benchmark_sdpa_cases_5_6_h100-%j.out
 #SBATCH --time=00:30:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -21,4 +21,4 @@ export CUDA_MODULE_LOADING=LAZY
 
 hostname
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
-uv run --frozen python benchmark_sdpa_cases_5_6.py "$@"
+uv run --frozen python -m benchmarks.benchmark_sdpa_cases_5_6 "$@"

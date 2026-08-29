@@ -10,8 +10,13 @@ H200 compute node `xgpk0` should have CUDA installed at `/usr/local/cuda-12.9/`.
 
 ## Repo structure
 
+- `optimized_transformer.py`: single construction API for all implemented cases.
+- `kernels`: optimized Triton kernels, model adapters, and CUDA sources.
+- `benchmarks`: correctness and performance benchmarks, including the reference.
+- `profiling`: profiling, validation, and diagnostic entrypoints.
 - `llm-scratchpad`: notes left by previous agent sessions for consumption by other agents.
-- `job-scripts`: Slurm job scripts
+- `job-scripts`: Slurm job scripts only.
+- `job-scripts/outputs`: Slurm logs and profiler output artifacts.
 
 ## Optimization methodology
 
