@@ -9,6 +9,14 @@ dependencies = [
   "triton>=3.7.1; sys_platform == 'linux'",
 ]
 
+[tool.uv]
+# PyTorch 2.13 pins cuDNN 9.20, whose wheel omits the tensor-IR sublibrary.
+# On H100 nodes it accidentally loads the system cuDNN 9.25 tensor-IR plugin
+# and fails the cross-sublibrary version check.  Use one complete cuDNN set.
+override-dependencies = [
+  "nvidia-cudnn-cu12==9.24.0.43; sys_platform == 'linux'",
+]
+
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
