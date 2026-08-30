@@ -24,4 +24,4 @@ nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 
 uv run --frozen python -m benchmarks.regression "$@"
 uv run --frozen python -m benchmarks.benchmark_megakernels \
-    --cases 1 2 3 4 5 6 7 8 9 10 11 12 --warmup 25 --rep 100
+    --cases 1 2 3 4 5 6 7 8 9 10 11 12 13 --warmup 25 --rep 100

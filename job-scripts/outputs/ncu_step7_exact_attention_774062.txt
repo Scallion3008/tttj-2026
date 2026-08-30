@@ -1,0 +1,461 @@
+[3658288] python3.12@127.0.0.1
+  nvjet_hsh_128x256_64x4_2x1_v_bz_coopA_TNN (2, 66, 1)x(384, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+
+    NVTX Push/Pop Stack for Thread 3658288:
+      <default domain>
+        <0,step7_exact_attention>
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         2.62
+    SM Frequency                    Ghz         1.34
+    Elapsed Cycles                cycle       254532
+    Memory Throughput                 %        74.62
+    DRAM Throughput                   %        74.07
+    Duration                         us       186.46
+    L1/TEX Cache Throughput           %        63.66
+    L2 Cache Throughput               %        76.88
+    SM Active Cycles              cycle    241413.66
+    Compute (SM) Throughput           %        25.35
+    ----------------------- ----------- ------------
+
+    OPT   Memory is more heavily utilized than Compute: Look at the Memory Workload Analysis section to identify the L2 
+          bottleneck. Check memory replay (coalescing) metrics to make sure you're efficiently utilizing the bytes      
+          transferred. Also consider whether it is possible to do more work per memory access (kernel fusion) or        
+          whether there are values you can (re)compute.                                                                 
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         0.67
+    Executed Ipc Elapsed  inst/cycle         0.65
+    Issue Slots Busy               %        16.22
+    Issued Ipc Active     inst/cycle         0.67
+    SM Busy                        %        25.35
+    -------------------- ----------- ------------
+
+    INF   Shared is the highest-utilized pipeline (25.4%) based on elapsed cycles in the workload, taking into account  
+          the rates of its different instructions. It is the logical sum of several other pipelines which can't         
+          achieve full utilization on their own. It executes 64-bit floating point and tensor operations. It's          
+          dominated by its Tensor (FP) sub-pipeline. It is well-utilized, but should not be a bottleneck. Based on the  
+          number of executed instructions, the highest utilized pipeline (10.7%) is ALU. It executes integer and logic  
+          operations. See the Profiling Guide                                                                           
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-decoder) or hover over the          
+          pipeline name to understand the workloads handled by each pipeline. The Instruction Statistics section shows  
+          the mix of executed instructions for this workload.                                                           
+
+    Section: Memory Workload Analysis
+    --------------------------------------- ----------- ------------
+    Metric Name                             Metric Unit Metric Value
+    --------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                                 0
+    Local Memory Spilling Request Overhead            %            0
+    L2 Sector Promotion Misses                        %        33.18
+    Shared Memory Spilling Requests                                0
+    Shared Memory Spilling Request Overhead           %            0
+    Memory Throughput                           Tbyte/s         2.92
+    Mem Busy                                          %        48.27
+    Max Bandwidth                                     %        74.62
+    L1/TEX Hit Rate                                   %            0
+    L2 Persisting Size                            Mbyte        11.80
+    L2 Compression Success Rate                       %            0
+    L2 Compression Ratio                              %            0
+    L2 Compression Input Sectors                 sector     16779004
+    L2 Hit Rate                                       %        96.03
+    Mem Pipes Busy                                    %        14.62
+    --------------------------------------- ----------- ------------
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   384
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   2
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                    132
+    Registers Per Thread             register/thread             168
+    Shared Memory Configuration Size           Kbyte          233.47
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block      Kbyte/block          213.19
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM             132
+    Stack Size                                                  1024
+    Threads                                   thread           50688
+    # TPCs                                                        66
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                                   1
+    -------------------------------- --------------- ---------------
+
+    OPT   If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have at least two  
+          blocks per multiprocessor (compared to the currently executed 1.0 blocks) This way, blocks that aren't        
+          waiting for __syncthreads() can keep the hardware busy.                                                       
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster           66
+    Max Cluster Size                      block           16
+    Overall GPU Occupancy                     %         0.59
+    Cluster Occupancy                         %         3.12
+    Block Limit Barriers                  block           21
+    Block Limit SM                        block           32
+    Block Limit Registers                 block            1
+    Block Limit Shared Mem                block            1
+    Block Limit Warps                     block            5
+    Theoretical Active Warps per SM        warp           12
+    Theoretical Occupancy                     %        18.75
+    Achieved Occupancy                        %        14.80
+    Achieved Active Warps Per SM           warp         9.48
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 81.25%                                                                                    
+          The 3.00 theoretical warps per scheduler this kernel can issue according to its occupancy are below the       
+          hardware maximum of 16. This kernel's theoretical occupancy (18.8%) is limited by the number of required      
+          registers, and the required amount of shared memory.                                                          
+
+  triton_poi_fused_bitwise_not_masked_fill_mul_view_0 (262144, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+
+    NVTX Push/Pop Stack for Thread 3658288:
+      <default domain>
+        <0,step7_exact_attention>
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         2.62
+    SM Frequency                    Ghz         1.54
+    Elapsed Cycles                cycle       468863
+    Memory Throughput                 %        88.45
+    DRAM Throughput                   %        88.45
+    Duration                         us       301.25
+    L1/TEX Cache Throughput           %        32.98
+    L2 Cache Throughput               %        82.81
+    SM Active Cycles              cycle    456111.69
+    Compute (SM) Throughput           %        40.29
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of this device.  
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         1.43
+    Executed Ipc Elapsed  inst/cycle         1.41
+    Issue Slots Busy               %        35.16
+    Issued Ipc Active     inst/cycle         1.43
+    SM Busy                        %        40.29
+    -------------------- ----------- ------------
+
+    INF   ALU is the highest-utilized pipeline (40.3%) based on elapsed cycles in the workload, taking into account the 
+          rates of its different instructions. It executes integer and logic operations. It is well-utilized, but       
+          should not be a bottleneck. Based on the number of executed instructions, the highest utilized pipeline       
+          (40.3%) is ALU. It executes integer and logic operations. Comparing the two, the overall pipeline             
+          utilization appears to be caused by frequent, low-latency instructions. See the Profiling Guide               
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-decoder) or hover over the          
+          pipeline name to understand the workloads handled by each pipeline. The Instruction Statistics section shows  
+          the mix of executed instructions for this workload.                                                           
+
+    Section: Memory Workload Analysis
+    --------------------------------------- ----------- ------------
+    Metric Name                             Metric Unit Metric Value
+    --------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                                 0
+    Local Memory Spilling Request Overhead            %            0
+    L2 Sector Promotion Misses                        %            0
+    Shared Memory Spilling Requests                                0
+    Shared Memory Spilling Request Overhead           %            0
+    Memory Throughput                           Tbyte/s         3.48
+    Mem Busy                                          %        56.69
+    Max Bandwidth                                     %        88.45
+    L1/TEX Hit Rate                                   %        33.25
+    L2 Persisting Size                            Mbyte        11.80
+    L2 Compression Success Rate                       %            0
+    L2 Compression Ratio                              %            0
+    L2 Compression Input Sectors                 sector     16778857
+    L2 Hit Rate                                       %        56.82
+    Mem Pipes Busy                                    %         6.87
+    --------------------------------------- ----------- ------------
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   128
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                 262144
+    Registers Per Thread             register/thread              16
+    Shared Memory Configuration Size           Kbyte           32.77
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM             132
+    Stack Size                                                  1024
+    Threads                                   thread        33554432
+    # TPCs                                                        66
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                              124.12
+    -------------------------------- --------------- ---------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           32
+    Block Limit SM                        block           32
+    Block Limit Registers                 block           32
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           16
+    Theoretical Active Warps per SM        warp           64
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        83.30
+    Achieved Active Warps Per SM           warp        53.31
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 16.7%                                                                                     
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (83.3%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+  void <unnamed>::softmax_warp_forward<c10::Half, c10::Half, float, 10, 0, 0, 32>(T2 *, const T1 *, int, int, int, const bool *, int, bool) (65536, 1, 1)x(32, 4, 1), Context 1, Stream 7, Device 0, CC 9.0
+
+    NVTX Push/Pop Stack for Thread 3658288:
+      <default domain>
+        <0,step7_exact_attention>
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         2.62
+    SM Frequency                    Ghz         1.68
+    Elapsed Cycles                cycle      1100083
+    Memory Throughput                 %        41.27
+    DRAM Throughput                   %        41.27
+    Duration                         us       648.61
+    L1/TEX Cache Throughput           %        21.33
+    L2 Cache Throughput               %        47.80
+    SM Active Cycles              cycle   1082453.48
+    Compute (SM) Throughput           %        84.44
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of this device.  
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing workloads in the Compute Workload Analysis section.                                        
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         3.40
+    Executed Ipc Elapsed  inst/cycle         3.38
+    Issue Slots Busy               %        84.44
+    Issued Ipc Active     inst/cycle         3.40
+    SM Busy                        %        84.44
+    -------------------- ----------- ------------
+
+    OPT   ALU is the highest-utilized pipeline (61.9%) based on elapsed cycles in the workload, taking into account the 
+          rates of its different instructions. It executes integer and logic operations. The pipeline is                
+          well-utilized, but might become a bottleneck if more work is added. Based on the number of executed           
+          instructions, the highest utilized pipeline (61.9%) is ALU. It executes integer and logic operations.         
+          Comparing the two, the overall pipeline utilization appears to be caused by frequent, low-latency             
+          instructions. See the Profiling Guide                                                                         
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-decoder) or hover over the          
+          pipeline name to understand the workloads handled by each pipeline. The Instruction Statistics section shows  
+          the mix of executed instructions for this workload.                                                           
+
+    Section: Memory Workload Analysis
+    --------------------------------------- ----------- ------------
+    Metric Name                             Metric Unit Metric Value
+    --------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                                 0
+    Local Memory Spilling Request Overhead            %            0
+    L2 Sector Promotion Misses                        %            0
+    Shared Memory Spilling Requests                                0
+    Shared Memory Spilling Request Overhead           %            0
+    Memory Throughput                           Tbyte/s         1.63
+    Mem Busy                                          %        30.39
+    Max Bandwidth                                     %        41.27
+    L1/TEX Hit Rate                                   %        24.93
+    L2 Persisting Size                            Mbyte        11.80
+    L2 Compression Success Rate                       %            0
+    L2 Compression Ratio                              %            0
+    L2 Compression Input Sectors                 sector     16778994
+    L2 Hit Rate                                       %        50.22
+    Mem Pipes Busy                                    %        19.49
+    --------------------------------------- ----------- ------------
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   128
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                  65536
+    Registers Per Thread             register/thread              48
+    Shared Memory Configuration Size           Kbyte           32.77
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM             132
+    Stack Size                                                  1024
+    Threads                                   thread         8388608
+    # TPCs                                                        66
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                               49.65
+    -------------------------------- --------------- ---------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           32
+    Block Limit SM                        block           32
+    Block Limit Registers                 block           10
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           16
+    Theoretical Active Warps per SM        warp           40
+    Theoretical Occupancy                     %        62.50
+    Achieved Occupancy                        %        60.11
+    Achieved Active Warps Per SM           warp        38.47
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 37.5%                                                                                     
+          The 10.00 theoretical warps per scheduler this kernel can issue according to its occupancy are below the      
+          hardware maximum of 16. This kernel's theoretical occupancy (62.5%) is limited by the number of required      
+          registers.                                                                                                    
+
+  nvjet_hsh_32x512_64x3_1x2_h_bz_NNN (2, 66, 1)x(384, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+
+    NVTX Push/Pop Stack for Thread 3658288:
+      <default domain>
+        <0,step7_exact_attention>
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         2.62
+    SM Frequency                    Ghz         1.43
+    Elapsed Cycles                cycle       244575
+    Memory Throughput                 %        85.47
+    DRAM Throughput                   %        85.47
+    Duration                         us       169.31
+    L1/TEX Cache Throughput           %        22.27
+    L2 Cache Throughput               %        87.63
+    SM Active Cycles              cycle    221557.64
+    Compute (SM) Throughput           %        13.09
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of this device.  
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         0.21
+    Executed Ipc Elapsed  inst/cycle         0.19
+    Issue Slots Busy               %         4.72
+    Issued Ipc Active     inst/cycle         0.21
+    SM Busy                        %        13.09
+    -------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 86.91%                                                                                    
+          All compute pipelines are under-utilized. Either this workload is very small or it doesn't issue enough warps 
+          per scheduler. Check the Launch Statistics and Scheduler Statistics sections for further details.             
+
+    Section: Memory Workload Analysis
+    --------------------------------------- ----------- ------------
+    Metric Name                             Metric Unit Metric Value
+    --------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                                 0
+    Local Memory Spilling Request Overhead            %            0
+    L2 Sector Promotion Misses                        %         1.01
+    Shared Memory Spilling Requests                                0
+    Shared Memory Spilling Request Overhead           %            0
+    Memory Throughput                           Tbyte/s         3.37
+    Mem Busy                                          %        53.91
+    Max Bandwidth                                     %        85.47
+    L1/TEX Hit Rate                                   %            0
+    L2 Persisting Size                            Mbyte        11.80
+    L2 Compression Success Rate                       %            0
+    L2 Compression Ratio                              %            0
+    L2 Compression Input Sectors                 sector       525722
+    L2 Hit Rate                                       %         6.09
+    Mem Pipes Busy                                    %         9.84
+    --------------------------------------- ----------- ------------
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   384
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   2
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                    132
+    Registers Per Thread             register/thread             168
+    Shared Memory Configuration Size           Kbyte          233.47
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block      Kbyte/block          225.44
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM             132
+    Stack Size                                                  1024
+    Threads                                   thread           50688
+    # TPCs                                                        66
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                                   1
+    -------------------------------- --------------- ---------------
+
+    OPT   If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have at least two  
+          blocks per multiprocessor (compared to the currently executed 1.0 blocks) This way, blocks that aren't        
+          waiting for __syncthreads() can keep the hardware busy.                                                       
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster           66
+    Max Cluster Size                      block           16
+    Overall GPU Occupancy                     %         0.59
+    Cluster Occupancy                         %         3.12
+    Block Limit Barriers                  block           21
+    Block Limit SM                        block           32
+    Block Limit Registers                 block            1
+    Block Limit Shared Mem                block            1
+    Block Limit Warps                     block            5
+    Theoretical Active Warps per SM        warp           12
+    Theoretical Occupancy                     %        18.75
+    Achieved Occupancy                        %        14.64
+    Achieved Active Warps Per SM           warp         9.37
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 81.25%                                                                                    
+          The 3.00 theoretical warps per scheduler this kernel can issue according to its occupancy are below the       
+          hardware maximum of 16. This kernel's theoretical occupancy (18.8%) is limited by the number of required      
+          registers, and the required amount of shared memory.                                                          
+

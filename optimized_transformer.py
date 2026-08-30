@@ -6,6 +6,10 @@ from typing import Final
 
 import torch.nn as nn
 
+from kernels.case13_hybrid import (
+    Case13OptimizedTransformer,
+    GraphedCase13Hybrid,
+)
 from kernels.layerwise_hybrid import Case8OptimizedTransformer
 from kernels.sequence_resident import SequenceResidentTransformer
 
@@ -25,6 +29,7 @@ IMPLEMENTED_CASES: Final[dict[int, tuple[int, int, int, int]]] = {
     10: (64, 128, 128, 2),
     11: (64, 128, 128, 16),
     12: (64, 32, 128, 4),
+    13: (64, 1024, 128, 4),
 }
 
 
@@ -66,6 +71,10 @@ def make_optimized_transformer(
     case_number = case_number_for_model(parameter_model)
     if case_number == 8:
         return Case8OptimizedTransformer(parameter_model)
+    if case_number == 13:
+        return GraphedCase13Hybrid(
+            Case13OptimizedTransformer(parameter_model)
+        )
     optimized = SequenceResidentTransformer(
         parameter_model,
         verbose_build=verbose_build,

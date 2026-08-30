@@ -88,6 +88,12 @@ def main() -> int:
             if case_number == 8:
                 family = "hybrid"
                 tuning = attention_tuning()
+            elif case_number == 13:
+                family = "hybrid"
+                tuning = {
+                    "attention": "compiled-exact/cudnn-adaptive",
+                    "linear_epilogues": "triton",
+                }
             elif is_step_4_shape(value, heads):
                 family = "dag"
                 tuning = resolved_dag_tuning(batch, sequence)
