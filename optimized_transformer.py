@@ -10,12 +10,13 @@ from kernels.case13_hybrid import (
     Case13OptimizedTransformer,
     GraphedCase13Hybrid,
 )
+from kernels.case14_hybrid import Case14OptimizedTransformer
 from kernels.layerwise_hybrid import Case8OptimizedTransformer
 from kernels.sequence_resident import SequenceResidentTransformer
 
 
 # Values are (batch, sequence, model dimension, heads). All implemented cases
-# use F=D, four layers, and causal attention.
+# use F=D and causal attention; case 14 has two layers and the others have four.
 IMPLEMENTED_CASES: Final[dict[int, tuple[int, int, int, int]]] = {
     1: (64, 128, 128, 4),
     2: (1, 128, 128, 4),
@@ -30,24 +31,22 @@ IMPLEMENTED_CASES: Final[dict[int, tuple[int, int, int, int]]] = {
     11: (64, 128, 128, 16),
     12: (64, 32, 128, 4),
     13: (64, 1024, 128, 4),
+    14: (32, 100000, 1024, 16),
 }
 
 
 def case_number_for_model(parameter_model: nn.Module) -> int:
     """Return the implemented benchmark case matching ``parameter_model``."""
     config = parameter_model.config
-    fixed = (
-        config.ffn_dim == config.d_model
-        and config.num_layers == 4
-        and config.causal
-    )
+    fixed = config.ffn_dim == config.d_model and config.causal
     shape = (
         config.batch_size,
         config.seq_len,
         config.d_model,
         config.num_heads,
     )
-    if fixed:
+    expected_layers = 2 if shape == IMPLEMENTED_CASES[14] else 4
+    if fixed and config.num_layers == expected_layers:
         for case_number, implemented_shape in IMPLEMENTED_CASES.items():
             if shape == implemented_shape:
                 return case_number
@@ -75,6 +74,8 @@ def make_optimized_transformer(
         return GraphedCase13Hybrid(
             Case13OptimizedTransformer(parameter_model)
         )
+    if case_number == 14:
+        return Case14OptimizedTransformer(parameter_model)
     optimized = SequenceResidentTransformer(
         parameter_model,
         verbose_build=verbose_build,

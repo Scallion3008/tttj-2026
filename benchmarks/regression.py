@@ -31,7 +31,7 @@ def make_models(case_number: int):
         d_model=model,
         num_heads=heads,
         ffn_dim=model,
-        num_layers=4,
+        num_layers=2 if case_number == 14 else 4,
         causal=True,
     )
     torch.manual_seed(SEED)
@@ -47,7 +47,9 @@ def main() -> int:
         nargs="+",
         type=int,
         choices=IMPLEMENTED_CASES,
-        default=IMPLEMENTED_CASES,
+        # Case 14 needs the memory-bounded reference in benchmark_step_8;
+        # the organizer's materialized reference would allocate ~10 TB.
+        default=tuple(case for case in IMPLEMENTED_CASES if case != 14),
     )
     parser.add_argument(
         "--padding-ratios",

@@ -27,7 +27,7 @@ def make_case(case_number: int):
         d_model=model,
         num_heads=heads,
         ffn_dim=model,
-        num_layers=4,
+        num_layers=2 if case_number == 14 else 4,
         causal=True,
     )
     torch.manual_seed(1234)
@@ -43,7 +43,9 @@ def main() -> int:
         nargs="+",
         type=int,
         choices=IMPLEMENTED_CASES,
-        default=IMPLEMENTED_CASES,
+        # The 100k-token case is intentionally opt-in because one repetition
+        # takes seconds; benchmark_step_8 is its primary harness.
+        default=tuple(case for case in IMPLEMENTED_CASES if case != 14),
     )
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--rep", type=int, default=500)
@@ -93,6 +95,12 @@ def main() -> int:
                 tuning = {
                     "attention": "compiled-exact/cudnn-adaptive",
                     "linear_epilogues": "triton",
+                }
+            elif case_number == 14:
+                family = "longctx"
+                tuning = {
+                    "attention": "exact-prefix-q640/stats-pv-m128n64",
+                    "linear": "separate-cublas",
                 }
             elif is_step_4_shape(value, heads):
                 family = "dag"

@@ -33,7 +33,7 @@ export MAX_JOBS=4
 export NVCC_THREADS=2
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
 export FLASH_ATTENTION_DISABLE_BACKWARD=TRUE
-export FLASH_ATTENTION_DISABLE_SPLIT=TRUE
+export FLASH_ATTENTION_DISABLE_SPLIT=FALSE
 export FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE
 export FLASH_ATTENTION_DISABLE_APPENDKV=TRUE
 export FLASH_ATTENTION_DISABLE_LOCAL=TRUE
@@ -55,5 +55,5 @@ mkdir -p "${WHEEL_ROOT}"
 cd "${SOURCE_ROOT}/hopper"
 uv run --project "${SLURM_SUBMIT_DIR}" --frozen python setup.py \
     bdist_wheel --dist-dir "${WHEEL_ROOT}"
-uv pip install --python "${SLURM_SUBMIT_DIR}/.venv/bin/python" --no-deps \
+uv pip install --python "${SLURM_SUBMIT_DIR}/.venv/bin/python" --no-deps --reinstall \
     "${WHEEL_ROOT}"/flash_attn_3-*.whl

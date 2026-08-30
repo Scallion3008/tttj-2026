@@ -95,7 +95,9 @@ def _residual_layer_norm_kernel(
 ):
     row = tl.program_id(0)
     columns = tl.arange(0, JIT_MODEL)
-    offsets = row * JIT_MODEL + columns
+    # Case 14 reuses this exact D1024 fusion with 3.2M rows. Its final linear
+    # element offset exceeds INT32_MAX, so promote before multiplying.
+    offsets = row.to(tl.int64) * JIT_MODEL + columns
     residual = tl.load(residual_ptr + offsets)
     branch = tl.load(branch_ptr + offsets)
     combined = (residual + branch).to(tl.float16)
