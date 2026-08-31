@@ -1,6 +1,4 @@
-# TikTok TechJam 2026 submission: task 3
-
-Task: optimize the absolute hell out of a simple transformer model.
+# TikTok TechJam 2026 task 3: transformer GPU kernel
 
 ## Model structure
 
