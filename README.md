@@ -52,6 +52,88 @@ The supplied model must already contain CUDA FP16 parameters. The constructor
 detects its benchmark case from `model.config`, prepares the appropriate
 resident/DAG/hybrid implementation, and rejects unsupported shapes.
 
+## Setup and build
+
+The repository locks both kinds of dependencies used by the production path:
+
+- Python packages are resolved exactly by `uv.lock`. In particular, the Linux
+  environment uses PyTorch 2.13.0+cu129, Triton 3.7.1, and the complete cuDNN
+  9.24.0.43 wheel.
+- FlashAttention is a submodule at commit
+  `ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820`. Its nested CUTLASS submodule is
+  pinned at `7127592069c2fe01b041e174ba4345ef9b279671`.
+
+Prerequisites are Git, `uv`, a C++ compiler, Ninja, and CUDA 12.9 installed at
+`/usr/local/cuda-12.9`. The build deliberately fails if that exact CUDA
+toolkit is unavailable. Production kernels require an NVIDIA Hopper GPU
+(compute capability 9.0); compiling the FA3 wheel itself does not require a
+GPU. If `uv` is not already installed, install it first with:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Clone and build from a fresh checkout with:
+
+```bash
+git clone https://github.com/Scallion3008/tttj-2026.git
+cd tttj-2026
+./build.sh
+```
+
+`build.sh` initializes only the required submodules, creates `.venv` from the
+frozen lockfile, temporarily applies the tracked CUDA 12.9 compatibility
+patch, builds the production FA3 specialization, and installs it into `.venv`.
+The vendor checkout is restored after the build and the wheel is saved under
+`.artifacts/wheels/`. The build is idempotent. `MAX_JOBS` and `NVCC_THREADS`
+may be set to tune build parallelism; their defaults are 4 and 2 respectively.
+
+On the SoC Slurm cluster, submit the CPU-only build from the repository root:
+
+```bash
+sbatch job-scripts/build_fa3.sh
+```
+
+The production FA3 build is forward-only SM90 FP16 with head-dim 64 and split
+support. Cases using head-dim 32 pad to that specialization. Backward, SM80,
+FP8, and unused head dimensions are omitted to keep compilation bounded.
+
+The only production vendor patch is
+`patches/flash-attention/system-cuda-12.9.patch`. It makes FA3 use the required
+system CUDA 12.9 compiler instead of downloading another nvcc. The experimental
+score-rounding FA3 patch documented in `llm-scratchpad/step_8_results.md` was
+slower and was rejected, so it is intentionally not part of the build.
+
+### Running
+
+Activate the environment and put the pinned cuDNN wheel ahead of any system
+cuDNN installation:
+
+```bash
+source .venv/bin/activate
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export CUDNN_ROOT="${PWD}/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib"
+export LD_LIBRARY_PATH="${CUDNN_ROOT}:${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export CUDA_MODULE_LOADING=LAZY
+```
+
+Then run the full correctness suite on an H200-141 allocation:
+
+```bash
+sbatch --gres=gpu:h200-141:1 job-scripts/validate_all_cases_h200.sh
+```
+
+For a local interactive Hopper allocation, the equivalent entrypoint is:
+
+```bash
+uv run --frozen python -m benchmarks.regression --cases 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+```
+
+The CUDA extensions under `kernels/csrc/` are compiled just in time by PyTorch
+on first use and cached in its normal extension cache; they need no separate
+build step.
+
 ## Repository layout
 
 - `optimized_transformer.py`: public optimized-model constructor and case map.
@@ -61,6 +143,9 @@ resident/DAG/hybrid implementation, and rejects unsupported shapes.
 - `job-scripts/`: Slurm scripts only.
 - `job-scripts/outputs/`: Slurm logs and Nsight report artifacts.
 - `llm-scratchpad/`: optimization notes and recorded results.
+- `vendor/`: pinned Git submodules, including FlashAttention and its CUTLASS
+  dependency.
+- `patches/`: versioned patches applied to vendor sources by `build.sh`.
 
 
 
