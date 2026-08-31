@@ -1,14 +1,17 @@
-"""Strict-reference long-context hybrid for benchmark case 14.
+"""Long-context FA3/exact hybrid for benchmark case 14.
 
-The production attention path materializes one causal score prefix at a time,
-reproduces PyTorch's large-row softmax reduction, and fuses the probability
-epilogue into PV. The surrounding D1024 projections remain large-M cuBLAS
-GEMMs, while residual/LayerNorm boundaries reuse the case-8 Triton fusion.
+The fast path uses packed-QKV Flash Attention 3. Low-RMS inputs automatically
+fall back to memory-bounded exact attention, which reproduces PyTorch's
+large-row softmax reduction and fuses the probability epilogue into PV. The
+surrounding D1024 projections remain large-M cuBLAS GEMMs, while
+residual/LayerNorm boundaries reuse the case-8 Triton fusion.
 """
 
 from __future__ import annotations
 
+import math
 import os
+import weakref
 from typing import Optional
 
 import torch
@@ -186,6 +189,10 @@ class Case14LayerwiseHybrid(nn.Module):
             self._last_mask_version = version
             self._last_mask_was_all_valid = bool(mask.all().item())
         return self._last_mask_was_all_valid
+
+    def _resolve_attention_backend(self, value: torch.Tensor) -> str:
+        """Select one backend for every layer of this forward pass."""
+        return self.attention_backend
 
     @staticmethod
     def _shape(value: torch.Tensor) -> tuple[int, int]:
@@ -670,6 +677,7 @@ class Case14LayerwiseHybrid(nn.Module):
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch, sequence = self._shape(value)
+        resolved_attention_backend = self._resolve_attention_backend(value)
         if valid_token_mask is None:
             valid_token_mask = torch.ones(
                 batch, sequence, device=value.device, dtype=torch.bool
@@ -683,7 +691,7 @@ class Case14LayerwiseHybrid(nn.Module):
         x = value
         normalized = self.parameter_model.layers[0].norm1(x)
         for layer_index, layer in enumerate(self.parameter_model.layers):
-            attention_backend = self.attention_backend
+            attention_backend = resolved_attention_backend
             if attention_backend == "exact-first":
                 attention_backend = "exact" if layer_index == 0 else "fa3"
             elif attention_backend.startswith("exact-fused-first-"):
@@ -764,24 +772,69 @@ class Case14LayerwiseHybrid(nn.Module):
 
 
 class Case14OptimizedTransformer(Case14LayerwiseHybrid):
-    """Production case-14 path selected by step-8 profiling."""
+    """Production FA3 path with an automatic exact-reference fallback."""
+
+    _FA3_MIN_INPUT_RMS = 0.75
 
     def __init__(self, parameter_model: nn.Module) -> None:
-        # Future score tiles grow within one allocator segment instead of
-        # leaving successively sized 10s-of-GiB fragments. The pinned PyTorch
-        # build supports changing this before the case-14 working set exists.
+        self.strict_attention = bool(
+            int(os.environ.get("TTTJ_STEP8_STRICT_ATTENTION", "0"))
+        )
+        # A low-RMS input can select the exact path after construction. Exact
+        # score tiles must therefore grow within one allocator segment rather
+        # than leaving successively sized 10s-of-GiB fragments.
         torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
         super().__init__(
             parameter_model,
-            attention_backend="exact-fused",
-            pack_qkv=False,
+            attention_backend="exact-fused" if self.strict_attention else "fa3",
+            # The exact backend ignores the packed weights and performs the
+            # three reference projections. Keeping them prepared lets the
+            # ordinary-scale path use FA3 without reconstructing the module.
+            pack_qkv=True,
             fuse_residual_norm=True,
         )
         device = next(parameter_model.parameters()).device
         memory = torch.cuda.get_device_properties(device).total_memory
         self.exact_query_chunk = 640 if memory >= 120 * 2**30 else 512
         self.use_fused_pv = True
+        self._last_value_ref: Optional[weakref.ReferenceType[torch.Tensor]] = None
+        self._last_value_version: Optional[int] = None
+        self._last_input_rms: Optional[float] = None
+        self._active_attention_backend = (
+            "exact-fused" if self.strict_attention else "fa3"
+        )
         self.prepare()
+        # ``prepare`` only loads the extension for a statically exact backend.
+        # Preload it for automatic fallback so the first low-RMS inference does
+        # not pay a build/load cost or discover a missing toolchain at runtime.
+        if not self.strict_attention:
+            from kernels.case14_softmax import _load_extension
+
+            _load_extension()
+
+    def _resolve_attention_backend(self, value: torch.Tensor) -> str:
+        if self.strict_attention:
+            return "exact-fused"
+        try:
+            version: Optional[int] = value._version
+        except RuntimeError:
+            version = None
+        last_value = (
+            None if self._last_value_ref is None else self._last_value_ref()
+        )
+        if value is not last_value or version != self._last_value_version:
+            self._last_value_ref = weakref.ref(value)
+            self._last_value_version = version
+            # Accumulate directly from FP16 into FP32 instead of materializing
+            # a full FP32 copy of the 6.10-GiB case-14 activation.
+            norm = torch.linalg.vector_norm(value, dtype=torch.float32)
+            self._last_input_rms = float(norm.item()) / math.sqrt(value.numel())
+            self._active_attention_backend = (
+                "fa3"
+                if self._last_input_rms >= self._FA3_MIN_INPUT_RMS
+                else "exact-fused"
+            )
+        return self._active_attention_backend
 
     def forward(
         self,

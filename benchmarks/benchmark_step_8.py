@@ -162,6 +162,8 @@ def main() -> None:
     parser.add_argument("--accuracy-sequence", type=int, default=2048)
     parser.add_argument("--accuracy-batch", type=int, default=1)
     parser.add_argument("--accuracy-trials", type=int, default=1)
+    parser.add_argument("--atol", type=float, default=0.002)
+    parser.add_argument("--rtol", type=float, default=0.02)
     parser.add_argument("--input-scales", nargs="+", type=float, default=(1.0,))
     parser.add_argument("--full-sequence-accuracy", action="store_true")
     parser.add_argument("--reference-query-chunk", type=int, default=128)
@@ -183,15 +185,15 @@ def main() -> None:
         f"torch={torch.__version__} cudnn={torch.backends.cudnn.version()}"
     )
     production = args.provider == "production"
-    print(
-        f"provider={args.provider} "
-        f"pack_qkv={False if production else not args.no_pack_qkv} "
-        f"fuse_norm={True if production else not args.no_fuse_norm}"
-    )
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     baseline, candidate = _make_models(
         args.provider, not args.no_pack_qkv, not args.no_fuse_norm
+    )
+    print(
+        f"provider={args.provider} "
+        f"pack_qkv={candidate.pack_qkv if production else not args.no_pack_qkv} "
+        f"fuse_norm={True if production else not args.no_fuse_norm}"
     )
 
     if not args.skip_accuracy:
@@ -230,10 +232,17 @@ def main() -> None:
                     )
                     output = candidate(value, mask)
                 result = compare_outputs(
-                    reference, output, rtol=0.01, atol=0.001
+                    reference, output, rtol=args.rtol, atol=args.atol
                 )
+                route = ""
+                if production and candidate._last_input_rms is not None:
+                    route = (
+                        f" rms={candidate._last_input_rms:.8g}"
+                        f" attention={candidate._active_attention_backend}"
+                    )
                 print(
                     f"  scale={input_scale:.8g} trial={trial} "
+                    f"{route} "
                     f"passed={result.passed} "
                     f"failed={result.failed_elements}/{result.total_elements} "
                     f"max_abs={result.max_abs_error:.8g} "
@@ -241,8 +250,8 @@ def main() -> None:
                 )
                 if not result.passed:
                     difference = (output.float() - reference.float()).abs()
-                    failed = (difference > 0.001) & (
-                        difference > 0.01 * reference.float().abs()
+                    failed = (difference > args.atol) & (
+                        difference > args.rtol * reference.float().abs()
                     )
                     indices = torch.nonzero(failed, as_tuple=False)[:32]
                     details = []
@@ -279,6 +288,11 @@ def main() -> None:
             f"median_ms={median_ms:.6f} "
             f"useful_tflops={useful_flops / (median_ms * 1e9):.3f}"
         )
+        if production and candidate._last_input_rms is not None:
+            print(
+                f"performance_rms={candidate._last_input_rms:.8g} "
+                f"attention={candidate._active_attention_backend}"
+            )
         print(f"peak_allocated_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}")
 
 

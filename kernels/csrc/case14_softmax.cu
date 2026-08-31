@@ -35,7 +35,6 @@ __device__ __forceinline__ float block_max(float value, float* shared) {
   const int lane = threadIdx.x & (kWarp - 1);
   const int warp = threadIdx.x / kWarp;
   value = warp_max(value);
-  __syncthreads();
   if (lane == 0) {
     shared[warp] = value;
   }
@@ -57,7 +56,6 @@ __device__ __forceinline__ float block_sum(float value, float* shared) {
   const int lane = threadIdx.x & (kWarp - 1);
   const int warp = threadIdx.x / kWarp;
   value = warp_sum(value);
-  __syncthreads();
   if (lane == 0) {
     shared[warp] = value;
   }
@@ -178,6 +176,7 @@ __global__ void exact_softmax_kernel(
   const int stored_vectorized_end = min(stored_classes, vectorized_end);
   float thread_max = -std::numeric_limits<float>::infinity();
   int vector_offset = threadIdx.x;
+#pragma unroll 8
   for (; vector_offset * kIlp < stored_vectorized_end;
        vector_offset += kThreads) {
     const int offset = vector_offset * kIlp;
@@ -203,6 +202,7 @@ __global__ void exact_softmax_kernel(
 
   float thread_sum = 0.0f;
   vector_offset = threadIdx.x;
+#pragma unroll 8
   for (; vector_offset * kIlp < stored_vectorized_end;
        vector_offset += kThreads) {
     const int offset = vector_offset * kIlp;
@@ -228,6 +228,7 @@ __global__ void exact_softmax_kernel(
   const float reciprocal = refined_reciprocal(sum);
 
   vector_offset = threadIdx.x;
+#pragma unroll 8
   for (; vector_offset * kIlp < stored_vectorized_end;
        vector_offset += kThreads) {
     const int offset = vector_offset * kIlp;
@@ -287,6 +288,7 @@ __global__ void exact_softmax_stats_kernel(
 
   float thread_max = -std::numeric_limits<float>::infinity();
   int vector_offset = threadIdx.x;
+#pragma unroll 8
   for (; vector_offset * kIlp < stored_vectorized_end;
        vector_offset += kThreads) {
     const int offset = vector_offset * kIlp;
@@ -312,6 +314,7 @@ __global__ void exact_softmax_stats_kernel(
 
   float thread_sum = 0.0f;
   vector_offset = threadIdx.x;
+#pragma unroll 8
   for (; vector_offset * kIlp < stored_vectorized_end;
        vector_offset += kThreads) {
     const int offset = vector_offset * kIlp;

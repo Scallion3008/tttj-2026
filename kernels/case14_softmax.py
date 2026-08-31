@@ -16,7 +16,7 @@ def _load_extension():
     if _extension is None:
         root = Path(__file__).resolve().parent
         _extension = load(
-            name="tttj_case14_softmax_v10",
+            name="tttj_case14_softmax_v16",
             sources=[
                 str(root / "csrc" / "case14_softmax.cpp"),
                 str(root / "csrc" / "case14_softmax.cu"),
