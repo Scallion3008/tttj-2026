@@ -157,33 +157,26 @@ uv run --frozen python -m benchmarks.benchmark_compile_comparison
 - `patches/`: versioned patches applied to vendor sources by `build.sh`.
 
 
-## Correctness evaluation
+## Results
 
-**Hard numerical gate vs PyTorch:** absolute error < 0.001, relative error < 0.01.
+Geomean speedup: **5.76x** vs. eager, **2.34x** vs. `torch.compile`.
 
-Numerical correctness utilities are located in [benchmarks/torch_transformer_benchmark.py](benchmarks/torch_transformer_benchmark.py).
-
-
-### Performance evaluation
-
-The performance of our implementation will be evaluated on a fixed set of input shapes:
-
-No. | Batch Size | QKV Dim | Heads | Seq Len | Layers | Causal | FFN Dim
---- | ---------- | ------- | ----- | ------- | ------ | ------ | -------
-1   | 64         | 128     | 4     | 128     | 4      | TRUE   | 128
-2   | 1          | 128     | 4     | 128     | 4      | TRUE   | 128
-3   | 4          | 128     | 4     | 128     | 4      | TRUE   | 128
-4   | 16         | 128     | 4     | 128     | 4      | TRUE   | 128
-5   | 128        | 128     | 4     | 128     | 4      | TRUE   | 128
-6   | 10000      | 128     | 4     | 128     | 4      | TRUE   | 128
-7   | 64         | 32      | 4     | 128     | 4      | TRUE   | 32
-8   | 64         | 1024    | 4     | 128     | 4      | TRUE   | 1024
-9   | 64         | 128     | 1     | 128     | 4      | TRUE   | 128
-10  | 64         | 128     | 2     | 128     | 4      | TRUE   | 128
-11  | 64         | 128     | 16    | 128     | 4      | TRUE   | 128
-12  | 64         | 128     | 4     | 32      | 4      | TRUE   | 128
-13  | 64         | 128     | 4     | 1024    | 4      | TRUE   | 128
-14  | 32         | 1024    | 16    | 100000  | 2      | TRUE   | 1024
+| Case | Production | Eager | Compile | Eager / production | Compile / production |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.169280 ms | 0.888320 ms | 0.355008 ms | 5.248x | 2.097x |
+| 2 | 0.114272 ms | 0.768128 ms | 0.356992 ms | 6.722x | 3.124x |
+| 3 | 0.109408 ms | 0.776000 ms | 0.357280 ms | 7.093x | 3.266x |
+| 4 | 0.109664 ms | 0.778496 ms | 0.355552 ms | 7.099x | 3.242x |
+| 5 | 0.262880 ms | 1.389344 ms | 0.517344 ms | 5.285x | 1.968x |
+| 6 | 12.374400 ms | 85.928352 ms | 26.261248 ms | 6.944x | 2.122x |
+| 7 | 0.095456 ms | 0.809440 ms | 0.354976 ms | 8.480x | 3.719x |
+| 8 | 1.065472 ms | 2.323616 ms | 1.292960 ms | 2.181x | 1.214x |
+| 9 | 0.158224 ms | 0.690816 ms | 0.291424 ms | 4.366x | 1.842x |
+| 10 | 0.155680 ms | 0.786304 ms | 0.358176 ms | 5.051x | 2.301x |
+| 11 | 0.220128 ms | 1.881632 ms | 0.619712 ms | 8.548x | 2.815x |
+| 12 | 0.104352 ms | 0.766224 ms | 0.353232 ms | 7.343x | 3.385x |
+| 13 | 4.443712 ms | 20.356400 ms | 5.360304 ms | 4.581x | 1.206x |
+| 14 | 2927.799072 ms | OOM | OOM | N/A | N/A |
 
 
 ## Limitations
