@@ -16,7 +16,11 @@ from benchmarks.torch_transformer_benchmark import (
 from kernels.case8_attention import attention_tuning
 from kernels.dag_megakernel import is_step_4_shape, resolved_dag_tuning
 from kernels.fused_megakernel import resolved_megakernel_tuning
-from optimized_transformer import IMPLEMENTED_CASES, make_optimized_transformer
+from optimized_transformer import (
+    IMPLEMENTED_CASES,
+    IMPLEMENTED_CASE_LAYERS,
+    make_optimized_transformer,
+)
 
 
 def make_case(case_number: int):
@@ -27,7 +31,7 @@ def make_case(case_number: int):
         d_model=model,
         num_heads=heads,
         ffn_dim=model,
-        num_layers=2 if case_number == 14 else 4,
+        num_layers=IMPLEMENTED_CASE_LAYERS[case_number],
         causal=True,
     )
     torch.manual_seed(1234)
@@ -43,12 +47,15 @@ def main() -> int:
         nargs="+",
         type=int,
         choices=IMPLEMENTED_CASES,
-        # The 100k-token case is intentionally opt-in because one repetition
-        # takes seconds; benchmark_step_8 is its primary harness.
-        default=tuple(case for case in IMPLEMENTED_CASES if case != 14),
+        default=tuple(IMPLEMENTED_CASES),
     )
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--rep", type=int, default=500)
+    # triton.testing.do_bench durations are milliseconds, not invocation
+    # counts. These values yield roughly one warmup and five measured case-14
+    # forwards instead of accidentally taking only one sample.
+    parser.add_argument("--long-context-warmup", type=int, default=3_000)
+    parser.add_argument("--long-context-rep", type=int, default=15_000)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -82,8 +89,12 @@ def main() -> int:
 
             median, low, high = triton.testing.do_bench(
                 invoke,
-                warmup=args.warmup,
-                rep=args.rep,
+                warmup=(
+                    args.long_context_warmup
+                    if case_number == 14
+                    else args.warmup
+                ),
+                rep=args.long_context_rep if case_number == 14 else args.rep,
                 quantiles=[0.5, 0.2, 0.8],
             )
             batch, sequence, model, heads = IMPLEMENTED_CASES[case_number]
@@ -99,7 +110,9 @@ def main() -> int:
             elif case_number == 14:
                 family = "longctx"
                 tuning = {
-                    "attention": "exact-prefix-q640/stats-pv-m128n64",
+                    "attention": getattr(
+                        optimized, "_active_attention_backend", "unresolved"
+                    ),
                     "linear": "separate-cublas",
                 }
             elif is_step_4_shape(value, heads):

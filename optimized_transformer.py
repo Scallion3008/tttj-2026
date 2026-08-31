@@ -16,7 +16,9 @@ from kernels.sequence_resident import SequenceResidentTransformer
 
 
 # Values are (batch, sequence, model dimension, heads). All implemented cases
-# use F=D and causal attention; case 14 has two layers and the others have four.
+# use F=D and causal attention. Layer counts live in the adjacent map so every
+# cross-case harness has one source of truth without changing this public map's
+# long-standing tuple format.
 IMPLEMENTED_CASES: Final[dict[int, tuple[int, int, int, int]]] = {
     1: (64, 128, 128, 4),
     2: (1, 128, 128, 4),
@@ -34,6 +36,11 @@ IMPLEMENTED_CASES: Final[dict[int, tuple[int, int, int, int]]] = {
     14: (32, 100000, 1024, 16),
 }
 
+IMPLEMENTED_CASE_LAYERS: Final[dict[int, int]] = {
+    case_number: 2 if case_number == 14 else 4
+    for case_number in IMPLEMENTED_CASES
+}
+
 
 def case_number_for_model(parameter_model: nn.Module) -> int:
     """Return the implemented benchmark case matching ``parameter_model``."""
@@ -45,10 +52,12 @@ def case_number_for_model(parameter_model: nn.Module) -> int:
         config.d_model,
         config.num_heads,
     )
-    expected_layers = 2 if shape == IMPLEMENTED_CASES[14] else 4
-    if fixed and config.num_layers == expected_layers:
+    if fixed:
         for case_number, implemented_shape in IMPLEMENTED_CASES.items():
-            if shape == implemented_shape:
+            if (
+                shape == implemented_shape
+                and config.num_layers == IMPLEMENTED_CASE_LAYERS[case_number]
+            ):
                 return case_number
     raise ValueError(
         "no optimized transformer is implemented for "

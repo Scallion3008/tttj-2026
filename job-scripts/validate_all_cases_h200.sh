@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tttj-regression
-#SBATCH --output=job-scripts/outputs/regression_h200-%j.out
-#SBATCH --time=00:30:00
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
+#SBATCH --job-name=tttj-all-cases
+#SBATCH --output=job-scripts/outputs/validate_all_cases_h200-%j.out
+#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
 
 set -euo pipefail
 
@@ -22,6 +22,9 @@ hostname
 nvcc --version
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 
-uv run --frozen python -m benchmarks.regression "$@"
-uv run --frozen python -m benchmarks.benchmark_megakernels \
-    --cases 1 2 3 4 5 6 7 8 9 10 11 12 13 14 --warmup 25 --rep 100
+uv run --frozen python -u -m benchmarks.regression \
+    --cases 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+uv run --frozen python -u -m benchmarks.benchmark_megakernels \
+    --cases 1 2 3 4 5 6 7 8 9 10 11 12 13 14 \
+    --warmup 25 --rep 100 \
+    --long-context-warmup 3000 --long-context-rep 15000

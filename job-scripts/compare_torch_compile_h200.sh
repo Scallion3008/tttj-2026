@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tttj-compile-gap
-#SBATCH --output=job-scripts/outputs/compare_torch_compile_h100-%j.out
-#SBATCH --time=02:00:00
+#SBATCH --job-name=tttj-compile-h200
+#SBATCH --output=job-scripts/outputs/compare_torch_compile_h200-%j.out
+#SBATCH --time=03:00:00
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=96G
+#SBATCH --mem=128G
 
-# Acquire one full H100-96 slot and retain it for the complete all-case sweep.
 set -euo pipefail
 
 CUDA_ROOT=/usr/local/cuda-12.9
@@ -31,5 +30,5 @@ nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 uv run --frozen python -u -m benchmarks.benchmark_compile_comparison \
     --cases 1 2 3 4 5 6 7 8 9 10 11 12 13 14 \
     --modes default reduce-overhead max-autotune \
-    --warmup 25 \
-    --rep 100
+    --warmup 25 --rep 100 \
+    --long-context-warmup 3000 --long-context-rep 15000

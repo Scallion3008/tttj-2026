@@ -19,7 +19,11 @@ from benchmarks.torch_transformer_benchmark import (
     TransformerConfig,
     generate_random_case,
 )
-from optimized_transformer import IMPLEMENTED_CASES, make_optimized_transformer
+from optimized_transformer import (
+    IMPLEMENTED_CASES,
+    IMPLEMENTED_CASE_LAYERS,
+    make_optimized_transformer,
+)
 
 
 def make_case(case_number: int):
@@ -30,7 +34,7 @@ def make_case(case_number: int):
         d_model=model,
         num_heads=heads,
         ffn_dim=model,
-        num_layers=4,
+        num_layers=IMPLEMENTED_CASE_LAYERS[case_number],
         causal=True,
     )
     torch.manual_seed(1234)

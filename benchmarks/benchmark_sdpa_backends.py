@@ -17,7 +17,7 @@ from benchmarks.torch_transformer_benchmark import (
     TransformerConfig,
     generate_random_case,
 )
-from optimized_transformer import IMPLEMENTED_CASES
+from optimized_transformer import IMPLEMENTED_CASES, IMPLEMENTED_CASE_LAYERS
 
 
 BACKENDS = {
@@ -64,7 +64,7 @@ def main() -> int:
                 d_model=model_dimension,
                 num_heads=heads,
                 ffn_dim=model_dimension,
-                num_layers=4,
+                num_layers=IMPLEMENTED_CASE_LAYERS[case_number],
                 causal=True,
             )
             torch.manual_seed(1234)
