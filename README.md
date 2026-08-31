@@ -52,6 +52,7 @@ The supplied model must already contain CUDA FP16 parameters. The constructor
 detects its benchmark case from `model.config`, prepares the appropriate
 resident/DAG/hybrid implementation, and rejects unsupported shapes.
 
+
 ## Setup and build
 
 The repository locks both kinds of dependencies used by the production path:
@@ -104,6 +105,7 @@ system CUDA 12.9 compiler instead of downloading another nvcc. The experimental
 score-rounding FA3 patch documented in `llm-scratchpad/step_8_results.md` was
 slower and was rejected, so it is intentionally not part of the build.
 
+
 ### Running
 
 Activate the environment and put the pinned cuDNN wheel ahead of any system
@@ -134,6 +136,13 @@ The CUDA extensions under `kernels/csrc/` are compiled just in time by PyTorch
 on first use and cached in its normal extension cache; they need no separate
 build step.
 
+To reproduce our speedups, run the following or its `sbatch` equivalent on an
+H200-141 allocation:
+
+```bash
+uv run --frozen python -m benchmarks.benchmark_compile_comparison
+```
+
 ## Repository layout
 
 - `optimized_transformer.py`: public optimized-model constructor and case map.
@@ -146,7 +155,6 @@ build step.
 - `vendor/`: pinned Git submodules, including FlashAttention and its CUTLASS
   dependency.
 - `patches/`: versioned patches applied to vendor sources by `build.sh`.
-
 
 
 ## Correctness evaluation
@@ -176,3 +184,20 @@ No. | Batch Size | QKV Dim | Heads | Seq Len | Layers | Causal | FFN Dim
 12  | 64         | 128     | 4     | 32      | 4      | TRUE   | 128
 13  | 64         | 128     | 4     | 1024    | 4      | TRUE   | 128
 14  | 32         | 1024    | 16    | 100000  | 2      | TRUE   | 1024
+
+
+## Limitations
+
+### Megakernels are hyper-specialized
+
+By their nature, megakernels are extremely specialized to the hardware they run on, as well as the model architecture for which they are built. Our insights from the development process are generalizable, but the kernels themselves are not.
+
+### Triton is not sufficiently fine-grained for maximum performance
+
+While suitably high-level for convenience, Triton ultimately loses to CUDA C++ in optimization potential. In particular, Triton lacks support for some advanced Hopper hardware features such as DSMEM. If the competition were longer, we would seriously have considered rewriting all kernels in CUDA C++ or CuTe DSL.
+
+
+## If we had more time, we would...
+
+- Implement all kernels in a lower-level language like CuTe DSL, Gluon, or CUDA C++, making full use of Hopper hardware features.
+- Spend more time tuning numerics, particularly those of optimized libraries. If Flash Attention 3, cuDNN Frontend or Torch SDPA could be made to pass the numerical tolerance gate, they would be usable in more layers of our hybrid strategies, likely giving significant speedup.
